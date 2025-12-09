@@ -83,11 +83,24 @@ class ReversalABEnv(gym.Env):
             self.state_encodings = {}
             for key, value in state_map.items():
                 if isinstance(value, (list, tuple)):
-                    self.state_encodings[key] = np.array(value, dtype=np.float32)
+                    val_array = np.array(value, dtype=np.float32)
                 elif isinstance(value, np.ndarray):
-                    self.state_encodings[key] = value.astype(np.float32)
+                    val_array = value.astype(np.float32)
                 else:
-                    self.state_encodings[key] = np.array(value, dtype=np.float32)
+                    val_array = np.array(value, dtype=np.float32)
+                
+                # If value is a scalar (index), convert to one-hot vector
+                if val_array.ndim == 0 or (val_array.ndim == 1 and len(val_array) == 1):
+                    idx = int(val_array.item() if val_array.ndim == 0 else val_array[0])
+                    # Create one-hot vector - determine length from observation space
+                    state_dim = self.observation_space.shape[0] if hasattr(self, 'observation_space') else len(default_state_encodings['A'])
+                    one_hot = np.zeros(state_dim, dtype=np.float32)
+                    if 0 <= idx < state_dim:
+                        one_hot[idx] = 1.0
+                    self.state_encodings[key] = one_hot
+                else:
+                    # Already a vector
+                    self.state_encodings[key] = val_array
             # Merge with defaults for any missing keys
             for key, value in default_state_encodings.items():
                 if key not in self.state_encodings:
@@ -397,11 +410,24 @@ class ReversalABCEnv(gym.Env):
             self.state_encodings = {}
             for key, value in state_map.items():
                 if isinstance(value, (list, tuple)):
-                    self.state_encodings[key] = np.array(value, dtype=np.float32)
+                    val_array = np.array(value, dtype=np.float32)
                 elif isinstance(value, np.ndarray):
-                    self.state_encodings[key] = value.astype(np.float32)
+                    val_array = value.astype(np.float32)
                 else:
-                    self.state_encodings[key] = np.array(value, dtype=np.float32)
+                    val_array = np.array(value, dtype=np.float32)
+                
+                # If value is a scalar (index), convert to one-hot vector
+                if val_array.ndim == 0 or (val_array.ndim == 1 and len(val_array) == 1):
+                    idx = int(val_array.item() if val_array.ndim == 0 else val_array[0])
+                    # Create one-hot vector - determine length from observation space
+                    state_dim = self.observation_space.shape[0] if hasattr(self, 'observation_space') else len(default_state_encodings['A'])
+                    one_hot = np.zeros(state_dim, dtype=np.float32)
+                    if 0 <= idx < state_dim:
+                        one_hot[idx] = 1.0
+                    self.state_encodings[key] = one_hot
+                else:
+                    # Already a vector
+                    self.state_encodings[key] = val_array
             # Merge with defaults for any missing keys
             for key, value in default_state_encodings.items():
                 if key not in self.state_encodings:
@@ -561,13 +587,11 @@ class ReversalABCEnv(gym.Env):
         
         if is_stimulus_state:
             # At stimulus state: agent takes action, outcome depends on action
-            # The outcome state in state_sequence represents available reward
-            # Check what outcome state is in the sequence at the next timestep
+            # Check reward_sequence to determine if reward is available at the outcome state
             outcome_timestep = self.current_timestep + 1
-            if outcome_timestep < len(self.state_sequence):
-                outcome_state_in_sequence = self.state_sequence[outcome_timestep]
-                # Check if outcome state is 'rewarded'
-                reward_available = self._is_state_equal(outcome_state_in_sequence, 'rewarded')
+            if outcome_timestep < len(self.reward_sequence):
+                # reward_sequence[outcome_timestep] > 0 indicates reward is available
+                reward_available = self.reward_sequence[outcome_timestep] > 0
             else:
                 reward_available = False
             
@@ -880,11 +904,24 @@ class ReversalABCDynamicEnv(gym.Env):
             self.state_encodings = {}
             for key, value in state_map.items():
                 if isinstance(value, (list, tuple)):
-                    self.state_encodings[key] = np.array(value, dtype=np.float32)
+                    val_array = np.array(value, dtype=np.float32)
                 elif isinstance(value, np.ndarray):
-                    self.state_encodings[key] = value.astype(np.float32)
+                    val_array = value.astype(np.float32)
                 else:
-                    self.state_encodings[key] = np.array(value, dtype=np.float32)
+                    val_array = np.array(value, dtype=np.float32)
+                
+                # If value is a scalar (index), convert to one-hot vector
+                if val_array.ndim == 0 or (val_array.ndim == 1 and len(val_array) == 1):
+                    idx = int(val_array.item() if val_array.ndim == 0 else val_array[0])
+                    # Create one-hot vector - determine length from observation space
+                    state_dim = self.observation_space.shape[0] if hasattr(self, 'observation_space') else len(default_state_encodings['A'])
+                    one_hot = np.zeros(state_dim, dtype=np.float32)
+                    if 0 <= idx < state_dim:
+                        one_hot[idx] = 1.0
+                    self.state_encodings[key] = one_hot
+                else:
+                    # Already a vector
+                    self.state_encodings[key] = val_array
             # Merge with defaults for any missing keys
             for key, value in default_state_encodings.items():
                 if key not in self.state_encodings:

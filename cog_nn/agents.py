@@ -55,7 +55,7 @@ class A2CAgent:
             'values': []
         }
     
-    def select_action(self, state, deterministic=False):
+    def select_action(self, state, deterministic=False, policy_clip=None):
         """
         Select an action given the current state.
         
@@ -80,8 +80,12 @@ class A2CAgent:
             value = self.critic(state)
 
             # Prevent zero probability
-            action_probs = F.softmax(action_probs, dim=-1)
-            action_probs = torch.clamp(action_probs, min=0.25)
+            if policy_clip is not None:
+                action_probs = F.softmax(action_probs, dim=-1)
+                action_probs = torch.clamp(action_probs, min=policy_clip)
+                
+                # Normalise again
+                action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
 
         if deterministic:
             # Greedy action
