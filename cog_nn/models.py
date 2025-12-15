@@ -2,7 +2,7 @@
 Model definitions for reinforcement learning and self-supervised learning.
 """
 
-from torch import nn
+from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import RNN, Linear
 
@@ -63,69 +63,68 @@ class RNNReadout(nn.Module):
         return out, rnn_out
 
 
-class ActorCriticRNN(nn.Module):
+class RNNActorCritic(nn.Module):
     """
-    Actor-Critic network with shared RNN backbone (for metalearning).
-    
-    The RNN processes state sequences, and separate heads output:
-    - Actor head: action probabilities
-    - Critic head: state value estimates
+    Combined Actor-Critic model with shared RNN backbone, with RNN receiving previous action and reward as input, as well as current state.
+    This is designed for meta-RL, based on the architecture in Wang et al. (2016).
     """
-    def __init__(self, state_size, action_size, rnn_hidden_size=128, 
-                 actor_hidden_size=64, critic_hidden_size=64, hook_fn=None):
-        super(ActorCriticRNN, self).__init__()
-        
-        # Shared RNN backbone
-        self.rnn = RNN(input_size=state_size,
-                      hidden_size=rnn_hidden_size,
-                      batch_first=True)
-        
-        # Actor head
-        self.actor_fc1 = nn.Linear(rnn_hidden_size, actor_hidden_size)
-        self.actor_fc2 = nn.Linear(actor_hidden_size, action_size)
+    def __init__(self, state_size, action_size, hidden_size=128, hook_fn=None):
+        super(RNNActorCritic, self).__init__()
+        self.rnn = RNN(input_size=state_size + action_size + 1,  # +1 for reward
+                       hidden_size=hidden_size,
+                       batch_first=True)
+        self.actor_fc = nn.Linear(hidden_size, action_size)
+        self.critic_fc = nn.Linear(hidden_size, 1)
         self.softmax = nn.Softmax(dim=-1)
-        
-        # Critic head
-        self.critic_fc1 = nn.Linear(rnn_hidden_size, critic_hidden_size)
-        self.critic_fc2 = nn.Linear(critic_hidden_size, 1)
-        
         if hook_fn is not None:
             self.rnn.register_forward_hook(hook_fn)
-    
-    def forward(self, state_sequence):
-        """
-        Forward pass through RNN and both heads.
-        
-        Args:
-            state_sequence: (batch_size, seq_len, state_size) or (seq_len, state_size)
-            
-        Returns:
-            action_probs: (batch_size, seq_len, action_size) or (seq_len, action_size)
-            values: (batch_size, seq_len, 1) or (seq_len, 1)
-            rnn_out: RNN hidden states
-        """
-        # Ensure batch dimension
-        if state_sequence.dim() == 2:
-            state_sequence = state_sequence.unsqueeze(0)
-            squeeze_batch = True
-        else:
-            squeeze_batch = False
-        
-        # RNN forward
-        rnn_out, _ = self.rnn(state_sequence)  # (batch, seq_len, rnn_hidden_size)
-        
+
+    def forward(self, state, prev_action, prev_reward, hidden_state=None):
+        # Concatenate state, previous action (one-hot), and previous reward
+        x = cat([state, prev_action, prev_reward.unsqueeze(-1)], dim=-1).unsqueeze(1)  # add seq dim
+        rnn_out, hidden_state = self.rnn(x, hidden_state)  # rnn_out shape: (batch, seq=1, hidden)
+        rnn_out = rnn_out.squeeze(1)  # remove seq dim
+
         # Actor head
-        actor_x = F.relu(self.actor_fc1(rnn_out))
-        actor_logits = self.actor_fc2(actor_x)
-        action_probs = self.softmax(actor_logits)
-        
+        action_logits = self.actor_fc(rnn_out)
+        action_probs = self.softmax(action_logits)
+
         # Critic head
-        critic_x = F.relu(self.critic_fc1(rnn_out))
-        values = self.critic_fc2(critic_x)
-        
-        if squeeze_batch:
-            action_probs = action_probs.squeeze(0)
-            values = values.squeeze(0)
-            rnn_out = rnn_out.squeeze(0)
-        
-        return action_probs, values, rnn_out
+        value = self.critic_fc(rnn_out)
+
+        return action_probs, value, hidden_state
+    
+class SelfSupervisedRNNActorCritic(nn.Module):
+    """
+    Combined Actor-Critic model with shared RNN backbone and self-supervised readout, with RNN receiving current state and previous action as input, and predicting next state.
+    This is based on the architecture in in Blanco-Pozo et al. (2024).
+    """
+    def __init__(self, state_size, action_size, hidden_size=128, hook_fn=None):
+        super(SelfSupervisedRNNActorCritic, self).__init__()
+        self.rnn = RNN(input_size=state_size + action_size,  # +1 for reward
+                       hidden_size=hidden_size,
+                       batch_first=True)
+        self.actor_fc = nn.Linear(hidden_size, action_size)
+        self.critic_fc = nn.Linear(hidden_size, 1)
+        self.ss_fc = nn.Linear(hidden_size, state_size)  # self-supervised readout to predict next state
+        self.softmax = nn.Softmax(dim=-1)
+        if hook_fn is not None:
+            self.rnn.register_forward_hook(hook_fn)
+
+    def forward(self, state, prev_action, hidden_state=None):
+        # Concatenate state and previous action (one-hot)
+        x = cat([state, prev_action], dim=-1).unsqueeze(1)  # add seq dim
+        rnn_out, hidden_state = self.rnn(x, hidden_state)  # rnn_out shape: (batch, seq=1, hidden)
+        rnn_out = rnn_out.squeeze(1)  # remove seq dim
+
+        # Actor head
+        action_logits = self.actor_fc(rnn_out)
+        action_probs = self.softmax(action_logits)
+
+        # Critic head
+        value = self.critic_fc(rnn_out)
+
+        # Self-supervised readout
+        ss_output = self.ss_fc(rnn_out)
+
+        return action_probs, value, ss_output, hidden_state

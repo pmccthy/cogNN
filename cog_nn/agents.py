@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
 
+from cog_nn.models import RNNActorCritic, SelfSupervisedRNNActorCritic
 
 class A2CAgent:
     """
@@ -360,7 +361,7 @@ class TabularVLearner:
             'target_value': target_value
         }
     
-class TabularQAgent:
+class QLearner:
     """
     Tabular Q-Learning agent for discrete state and action spaces.
     
@@ -431,114 +432,328 @@ class TabularQAgent:
             'target_q': target_q
         }
 
-class HybridSSLRNNA2CAgent:
+class SARSA:
     """
-    Hybrid model with RNN that does next-state prediction based on current state and action,
-    and actor-critic for value estimation and action generation.  
+    TODO: write up SARSA agent
     """
-    def __init__(self, rnn_model, actor, critic, rnn_optimizer, actor_optimizer, critic_optimizer, 
-                 gamma=0.9, device='cpu'):
+    pass
+
+
+class DQN:
+    """
+    TODO: implement Deep-Q Network
+    """
+    pass
+
+class MetaA2CAgent:
+    """Meta-Reinforcement Learning agent using an RNN-based Actor-Critic model, as defined by the RNNActorCritic model in models.py."""
+    def __init__(self, state_size, action_size, hidden_size=128, hook_fn=None):
+        self.model = RNNActorCritic(state_size, action_size, hidden_size, hook_fn)
+        self.hidden_state = None  # Initialize hidden state to None
+    
+    def reset_hidden_state(self):
+        """Reset the RNN hidden state."""
+        self.hidden_state = None
+    
+    def select_action(self, state, prev_action, prev_reward, deterministic=False, policy_clip=None):
         """
-        Initialize Hybrid SSL RNN A2C learner.
+        Select an action given the current state, previous action, and previous reward.
         
         Args:
-            rnn_model: RNN model for next-state prediction
-            actor: Actor network (policy)
-            critic: Critic network (value function)
-            rnn_optimizer: Optimizer for RNN model
-            actor_optimizer: Optimizer for actor network
-            critic_optimizer: Optimizer for critic network
-            gamma: Discount factor for future rewards
-            device: Device to run on ('cpu' or 'cuda')
+            state: Current state (tensor)
+            prev_action: Previous action (one-hot tensor)
+            prev_reward: Previous reward (tensor)
+            deterministic: If True, select greedy action. If False, sample from policy.
+            policy_clip: Minimum probability for each action (prevents zero probability). If None, no clipping.
         """
-        self.rnn_model = rnn_model
-        self.actor = actor
-        self.critic = critic
-        self.rnn_optimizer = rnn_optimizer
-        self.actor_optimizer = actor_optimizer
-        self.critic_optimizer = critic_optimizer
-        self.gamma = gamma
-        self.device = device
+        state = state.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        prev_action = prev_action.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        prev_reward = prev_reward.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
         
-        # Move models to device
-        self.rnn_model.to(device)
-        self.actor.to(device)
-        self.critic.to(device)
-
-        # Training metrics
-        self.training_history = {
-            'rnn_loss': [],
-            'actor_loss': [],
-            'critic_loss': [],
-            'rewards': [],  
-        }
-
-    def select_action(self, state, deterministic=False):
-        """
-        Select an action given the current state.
-        """
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-
+        with torch.no_grad():
+            action_probs, value, self.hidden_state = self.model(state, prev_action, prev_reward, self.hidden_state)
+        
+        action_probs = action_probs.squeeze(0)  # Remove batch dim
+        
+        # Prevent zero probability with policy clipping
+        if policy_clip is not None:
+            action_probs = torch.clamp(action_probs, min=policy_clip)
+            # Normalise again
+            action_probs = action_probs / action_probs.sum()
+        
         if deterministic:
-            action_probs = self.actor(state)
-            action = action_probs.argmax(dim=-1)
+            action = torch.argmax(action_probs).item()
+            action_prob = action_probs[action].item()
         else:
-            action_probs = self.actor(state)
-            action = action_probs.multinomial(num_samples=1)
-
-        return action.item()
+            dist = Categorical(action_probs)
+            action = dist.sample().item()
+            action_prob = action_probs[action].item()
+        
+        return action, action_prob, value.item()
     
-    def update(self, state, action, reward, next_state, done):
+    def update(self, states, prev_actions, prev_rewards, actions, rewards, next_states, next_prev_actions, next_prev_rewards, dones):
         """
-        Update RNN, Actor, and Critic networks.
+        Update the RNN Actor-Critic model using the provided batch of experience.
+        
+        Args:
+            states: Batch of current states (batch_size, state_dim)
+            prev_actions: Batch of previous actions (batch_size, action_dim)
+            prev_rewards: Batch of previous rewards (batch_size,)
+            actions: Batch of actions taken (batch_size,)
+            rewards: Batch of rewards received (batch_size,)
+            next_states: Batch of next states (batch_size, state_dim)
+            next_prev_actions: Batch of next previous actions (batch_size, action_dim)
+            next_prev_rewards: Batch of next previous rewards (batch_size,)
+            dones: Batch of done flags (batch_size,)
         """
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        action = torch.LongTensor([action]).unsqueeze(0).to(self.device)
-        reward = torch.FloatTensor([reward]).unsqueeze(0).to(self.device)
-        next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
-        done = torch.FloatTensor([done]).unsqueeze(0).to(self.device)
-
-        # RNN update
-        predicted_next_state = self.rnn_model(state, action)
-        rnn_loss = F.mse_loss(predicted_next_state, next_state)
-
-        self.rnn_optimizer.zero_grad()
-        rnn_loss.backward()
-        self.rnn_optimizer.step()
-
-        # Critic update
-        value = self.critic(state)
-        next_value = self.critic(next_state).detach()
-        target_value = reward + self.gamma * next_value * (1 - done)
-        critic_loss = F.mse_loss(value, target_value)
-
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-
-        # Actor update
-        action_probs = self.actor(state)
+        # Convert to tensors and move to device
+        device = next(self.model.parameters()).device
+        
+        states = states.to(device)
+        prev_actions = prev_actions.to(device)
+        prev_rewards = prev_rewards.to(device)
+        actions = actions.to(device)
+        rewards = rewards.to(device)
+        next_states = next_states.to(device)
+        next_prev_actions = next_prev_actions.to(device)
+        next_prev_rewards = next_prev_rewards.to(device)
+        dones = dones.to(device)
+        
+        # Get current action probabilities and values
+        action_probs, values, _ = self.model(states, prev_actions, prev_rewards)
         dist = Categorical(action_probs)
-        log_prob = dist.log_prob(action)
-        advantage = (target_value - value).detach()
-        actor_loss = -(log_prob * advantage).mean()
-
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        # Store metrics
-        self.training_history['rnn_loss'].append(rnn_loss.item())
-        self.training_history['critic_loss'].append(critic_loss.item())
-        self.training_history['actor_loss'].append(actor_loss.item())
-        self.training_history['rewards'].append(reward.item())
-
+        log_probs = dist.log_prob(actions)
+        
+        # Get next values
+        with torch.no_grad():
+            _, next_values, _ = self.model(next_states, next_prev_actions, next_prev_rewards)
+        
+        # Compute target values and advantages
+        target_values = rewards + self.model.gamma * next_values * (1 - dones)
+        advantages = target_values - values
+        
+        # Actor loss
+        actor_loss = -(log_probs * advantages.detach()).mean()
+        
+        # Critic loss
+        critic_loss = (target_values - values).pow(2).mean()
+        
+        # Total loss
+        total_loss = actor_loss + critic_loss
+        
+        # Backpropagation
+        self.model.optimizer.zero_grad()
+        total_loss.backward()
+        self.model.optimizer.step()
+        
         return {
-            'rnn_loss': rnn_loss.item(),
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
-            'advantage': advantage.item(),
-            'value': value.item(), 
-            'target_value': target_value.item()
+            'mean_advantage': advantages.mean().item(),
+            'mean_value': values.mean().item()
         }
 
+class SelfSupervisedRNNA2CAgent:
+    # TODO: Check training logic of this - perhaps SSL loss should just train RNN and AC losses should just train heads?
+    """Meta-RL agent with self-supervised RNN Actor-Critic model."""
+    def __init__(self, state_size, action_size, hidden_size=128, hook_fn=None):
+        self.model = SelfSupervisedRNNActorCritic(state_size, action_size, hidden_size, hook_fn)
+        self.hidden_state = None  # Initialize hidden state to None
+    
+    def reset_hidden_state(self):
+        """Reset the RNN hidden state."""
+        self.hidden_state = None
+    
+    def select_action(self, state, prev_action, prev_reward, deterministic=False):
+        """
+        Select an action given the current state, previous action, and previous reward.
+        
+        Args:
+            state: Current state (tensor)
+            prev_action: Previous action (one-hot tensor)
+            prev_reward: Previous reward (tensor)
+            deterministic: If True, select greedy action. If False, sample from policy.
+        """
+        state = state.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        prev_action = prev_action.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        prev_reward = prev_reward.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        
+        with torch.no_grad():
+            action_probs, value, self.hidden_state = self.model(state, prev_action, prev_reward, self.hidden_state)
+        
+        action_probs = action_probs.squeeze(0)  # Remove batch dim
+        
+        if deterministic:
+            action = torch.argmax(action_probs).item()
+            action_prob = action_probs[action].item()
+        else:
+            dist = Categorical(action_probs)
+            action = dist.sample().item()
+            action_prob = action_probs[action].item()
+        
+        return action, action_prob, value.item()
+    
+    def update(self, states, prev_actions, actions, rewards, next_states, next_prev_actions, dones):
+        """
+        Update the RNN Actor-Critic model using the provided batch of experience.
+        Args:
+            states: Batch of current states (batch_size, state_dim)
+            prev_actions: Batch of previous actions (batch_size, action_dim)
+            actions: Batch of actions taken (batch_size,)
+            rewards: Batch of rewards received (batch_size,)
+            next_states: Batch of next states (batch_size, state_dim)
+            next_prev_actions: Batch of next previous actions (batch_size, action_dim)
+            dones: Batch of done flags (batch_size,)
+        """
+        # Convert to tensors and move to device
+        device = next(self.model.parameters()).device
+        
+        states = states.to(device)
+        prev_actions = prev_actions.to(device)
+        actions = actions.to(device)
+        rewards = rewards.to(device)
+        next_states = next_states.to(device)
+        next_prev_actions = next_prev_actions.to(device)
+        dones = dones.to(device)
+        
+        # Get current action probabilities and values
+        action_probs, values, _ = self.model(states, prev_actions, None)
+        dist = Categorical(action_probs)
+        log_probs = dist.log_prob(actions)
+        
+        # Get next values
+        with torch.no_grad():
+            _, next_values, ss_output, _ = self.model(next_states, next_prev_actions, None)
+        
+        # Compute target values and advantages
+        target_values = rewards + self.model.gamma * next_values * (1 - dones)
+        advantages = target_values - values
+        
+        # Actor loss
+        actor_loss = -(log_probs * advantages.detach()).mean()
+        
+        # Critic loss
+        critic_loss = (target_values - values).pow(2).mean()
+        
+        # Self-supervised loss (predict next state)
+        ss_loss = F.mse_loss(ss_output, next_states)
+
+        # Total loss
+        total_loss = actor_loss + critic_loss + ss_loss
+
+        # Backpropagation
+        self.model.optimizer.zero_grad()
+        total_loss.backward()
+        self.model.optimizer.step()
+        
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': critic_loss.item(),
+            'mean_advantage': advantages.mean().item(),
+            'mean_value': values.mean().item()
+        }
+    
+class SelfSupervisedRNNA2CAgentSeparateTraining:
+    """
+    Meta-RL agent with self-supervised RNN Actor-Critic model in which AC and SSL losses are used to train core and heads separately
+    (stop grad on connetion between RNN and heads).
+    """
+    def __init__(self, state_size, action_size, hidden_size=128, hook_fn=None):
+        self.model = SelfSupervisedRNNActorCritic(state_size, action_size, hidden_size, hook_fn)
+        self.hidden_state = None  # Initialize hidden state to None
+            
+    def reset_hidden_state(self):
+        """Reset the RNN hidden state."""
+        self.hidden_state = None
+    
+    def select_action(self, state, prev_action, prev_reward, deterministic=False):
+        """
+        Select an action given the current state, previous action, and previous reward.
+        
+        Args:
+            state: Current state (tensor)
+            prev_action: Previous action (one-hot tensor)
+            prev_reward: Previous reward (tensor)
+            deterministic: If True, select greedy action. If False, sample from policy.
+        """
+        state = state.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        prev_action = prev_action.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        prev_reward = prev_reward.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
+        
+        with torch.no_grad():
+            action_probs, value, self.hidden_state = self.model(state, prev_action, prev_reward, self.hidden_state)
+        
+        action_probs = action_probs.squeeze(0)  # Remove batch dim
+        
+        if deterministic:
+            action = torch.argmax(action_probs).item()
+            action_prob = action_probs[action].item()
+        else:
+            dist = Categorical(action_probs)
+            action = dist.sample().item()
+            action_prob = action_probs[action].item()
+        
+        return action, action_prob, value.item()
+
+    def update(self, states, prev_actions, actions, rewards, next_states, next_prev_actions, dones):
+        """
+        Update the RNN Actor-Critic model using the provided batch of experience.
+        Args:
+            states: Batch of current states (batch_size, state_dim)
+            prev_actions: Batch of previous actions (batch_size, action_dim)
+            actions: Batch of actions taken (batch_size,)
+            rewards: Batch of rewards received (batch_size,)
+            next_states: Batch of next states (batch_size, state_dim)
+            next_prev_actions: Batch of next previous actions (batch_size, action_dim)
+            dones: Batch of done flags (batch_size,)
+        """
+        # Convert to tensors and move to device
+        device = next(self.model.parameters()).device
+        
+        states = states.to(device)
+        prev_actions = prev_actions.to(device)
+        actions = actions.to(device)
+        rewards = rewards.to(device)
+        next_states = next_states.to(device)
+        next_prev_actions = next_prev_actions.to(device)
+        dones = dones.to(device)
+        
+        # Get current action probabilities and values
+        action_probs, values, _ = self.model(states, prev_actions, None)
+        dist = Categorical(action_probs)
+        log_probs = dist.log_prob(actions)
+        
+        # Get next values
+        with torch.no_grad():
+            _, next_values, ss_output, _ = self.model(next_states, next_prev_actions, None)
+        
+        # Compute target values and advantages
+        target_values = rewards + self.model.gamma * next_values * (1 - dones)
+        advantages = target_values - values
+        
+        # Actor loss
+        actor_loss = -(log_probs * advantages.detach()).mean()
+        
+        # Critic loss
+        critic_loss = (target_values - values).pow(2).mean()
+        
+        # Self-supervised loss (predict next state)
+        ss_loss = F.mse_loss(ss_output, next_states)
+
+        # Backpropagation for Actor-Critic (stop grad on RNN to heads connection)
+        self.model.optimizer.zero_grad()
+        (actor_loss + critic_loss).backward(retain_graph=True)
+        self.model.optimizer.step()
+
+        # Backpropagation for Self-Supervised loss
+        self.model.optimizer.zero_grad()
+        ss_loss.backward()
+        self.model.optimizer.step()
+        
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': critic_loss.item(),
+            'mean_advantage': advantages.mean().item(),
+            'mean_value': values.mean().item()
+        }
+    

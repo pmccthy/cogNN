@@ -1112,3 +1112,451 @@ class ReversalABCDynamicEnv(gym.Env):
                   f"State type: {self.current_state_type}, "
                   f"State: {state_name}, "
                   f"Stimulus: {self.current_stimulus}")
+
+
+class ReversalABCMultiTimestepEnv(gym.Env):
+    """
+    Reversal ABC task environment with multi-timestep trial structure.
+    
+    Trial structure:
+    - Stimulus window: Multiple timesteps showing the stimulus
+    - Reward availability window: Multiple timesteps where reward can be obtained
+    - Outcome state: Determined by action during reward window
+    - ITI: Random timesteps showing no stimulus
+    
+    States (one-hot encoded, 7D):
+    - A: Stimulus A [1, 0, 0, 0, 0, 0, 0]
+    - B: Stimulus B [0, 1, 0, 0, 0, 0, 0]
+    - C: Stimulus C [0, 0, 1, 0, 0, 0, 0]
+    - reward_unknown: Outcome state, reward unknown [0, 0, 0, 1, 0, 0, 0]
+    - unrewarded: No reward state [0, 0, 0, 0, 1, 0, 0]
+    - rewarded: Reward state [0, 0, 0, 0, 0, 1, 0]
+    - ITI: Inter-trial interval [0, 0, 0, 0, 0, 0, 1]
+    
+    Actions:
+    - 0: lick
+    - 1: no_lick
+    """
+    
+    metadata = {"render_modes": ["human"], "render_fps": 4}
+    
+    def __init__(self, state_sequence=None, reward_sequence=None, reversal_mask=None,
+                 trial_structure=None, reward_lick=1.0, lick_no_reward=-1.0, no_lick=0.0,
+                 render_mode=None, state_map=None):
+        """
+        Initialize the environment.
+        
+        Args:
+            state_sequence: Pre-generated sequence of states (N x 7 array)
+            reward_sequence: Pre-generated sequence of reward availability (N x 1 array)
+            reversal_mask: Array indicating reversal phase (0=pre, 1=post) for each trial
+            trial_structure: List of dicts with trial structure information
+            reward_lick: Reward when reward is available and agent licks (default: 1.0)
+            lick_no_reward: Reward when no reward available but agent licks (default: -1.0)
+            no_lick: Reward when agent doesn't lick (default: 0.0)
+            render_mode: Rendering mode
+            state_map: Dict mapping state names to numpy arrays
+        """
+        super().__init__()
+        
+        # Store reward values
+        self.reward_lick = reward_lick
+        self.lick_no_reward = lick_no_reward
+        self.no_lick = no_lick
+        
+        # State space: 7D one-hot encoding (A, B, C, reward_unknown, unrewarded, rewarded, ITI)
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(7,), dtype=np.float32
+        )
+        
+        # Action space: lick (0) or no_lick (1)
+        self.action_space = spaces.Discrete(2)
+        
+        # Default state encodings (one-hot)
+        default_state_encodings = {
+            'A': np.array([1, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+            'B': np.array([0, 1, 0, 0, 0, 0, 0], dtype=np.float32),
+            'C': np.array([0, 0, 1, 0, 0, 0, 0], dtype=np.float32),
+            'reward_unknown': np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float32),
+            'unrewarded': np.array([0, 0, 0, 0, 1, 0, 0], dtype=np.float32),
+            'rewarded': np.array([0, 0, 0, 0, 0, 1, 0], dtype=np.float32),
+            'ITI': np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
+        }
+        
+        # Use state_map if provided, otherwise use defaults
+        if state_map is not None:
+            self.state_encodings = {}
+            for key, value in state_map.items():
+                if isinstance(value, (list, tuple)):
+                    val_array = np.array(value, dtype=np.float32)
+                elif isinstance(value, np.ndarray):
+                    val_array = value.astype(np.float32)
+                else:
+                    val_array = np.array(value, dtype=np.float32)
+                
+                # If value is a scalar (index), convert to one-hot vector
+                if val_array.ndim == 0 or (val_array.ndim == 1 and len(val_array) == 1):
+                    idx = int(val_array.item() if val_array.ndim == 0 else val_array[0])
+                    state_dim = 7
+                    one_hot = np.zeros(state_dim, dtype=np.float32)
+                    if 0 <= idx < state_dim:
+                        one_hot[idx] = 1.0
+                    self.state_encodings[key] = one_hot
+                else:
+                    self.state_encodings[key] = val_array
+            for key, value in default_state_encodings.items():
+                if key not in self.state_encodings:
+                    self.state_encodings[key] = value
+        else:
+            self.state_encodings = default_state_encodings
+        
+        # Store sequences
+        if state_sequence is None:
+            raise ValueError("state_sequence must be provided")
+        self.state_sequence = np.array(state_sequence, dtype=np.float32)
+        
+        # Check state sequence dimension matches observation space
+        if self.state_sequence.shape[1] != self.observation_space.shape[0]:
+            raise ValueError(
+                f"State sequence dimension ({self.state_sequence.shape[1]}) does not match "
+                f"observation space dimension ({self.observation_space.shape[0]}). "
+                f"Please regenerate the task data with the updated task generation script."
+            )
+        
+        if reward_sequence is None:
+            raise ValueError("reward_sequence must be provided")
+        self.reward_sequence = np.array(reward_sequence, dtype=np.float32)
+        if self.reward_sequence.ndim > 1:
+            self.reward_sequence = self.reward_sequence.flatten()
+        
+        if len(self.state_sequence) != len(self.reward_sequence):
+            raise ValueError("state_sequence and reward_sequence must have same length")
+        
+        # Store trial structure
+        self.trial_structure = trial_structure if trial_structure is not None else []
+        
+        # Create mapping from timestep to trial info
+        self.timestep_to_trial = {}
+        if self.trial_structure:
+            for trial_info in self.trial_structure:
+                for t in trial_info['stim_window'] + trial_info['reward_window']:
+                    self.timestep_to_trial[t] = trial_info
+                # Also map ITI timesteps
+                if 'iti_window' in trial_info:
+                    for t in trial_info['iti_window']:
+                        self.timestep_to_trial[t] = trial_info
+        
+        # Store reversal mask
+        if reversal_mask is not None:
+            self.reversal_mask = np.array(reversal_mask)
+        else:
+            self.reversal_mask = None
+        
+        self.render_mode = render_mode
+        
+        # Internal state
+        self.current_timestep = 0
+        self.max_timesteps = len(self.state_sequence) - 1
+        self.current_trial_idx = None
+        self.reward_window_action = None  # Track action taken during reward window
+        self.in_outcome_state = False  # Track if we've transitioned to outcome state
+        self.outcome_state = None  # Store the outcome state (rewarded/unrewarded)
+        
+    def _is_stimulus_state(self, state):
+        """Check if state is a stimulus state (A, B, or C)."""
+        state_idx = np.argmax(state)
+        return state_idx in [0, 1, 2]
+    
+    def _is_outcome_state(self, state):
+        """Check if state is an outcome state (reward_unknown, rewarded, or unrewarded)."""
+        state_idx = np.argmax(state)
+        return state_idx in [3, 4, 5]
+    
+    def _is_reward_unknown_state(self, state):
+        """Check if state is reward_unknown outcome state."""
+        state_idx = np.argmax(state)
+        return state_idx == 3
+    
+    def _is_iti_state(self, state):
+        """Check if state is ITI."""
+        state_idx = np.argmax(state)
+        return state_idx == 6
+    
+    def reset(self, seed=None, options=None):
+        """Reset the environment to start of sequence."""
+        super().reset(seed=seed)
+        
+        self.current_timestep = 0
+        self.current_trial_idx = None
+        self.reward_window_action = None
+        self.in_outcome_state = False
+        self.outcome_state = None
+        
+        # Get initial state from sequence
+        self.current_state = self.state_sequence[0]
+        
+        state_idx = int(np.argmax(self.current_state))
+        state_names = ['A', 'B', 'C', 'reward_unknown', 'unrewarded', 'rewarded', 'ITI']
+        
+        info = {
+            'timestep': self.current_timestep,
+            'state_idx': state_idx,
+            'state_name': state_names[state_idx] if state_idx < len(state_names) else 'unknown',
+            'trial_idx': None,
+            'trial_phase': None  # 'stim_window', 'reward_window', 'outcome', 'iti'
+        }
+        
+        return self.current_state.copy(), info
+    
+    def step(self, action):
+        """
+        Execute one step in the environment.
+        
+        Args:
+            action: 0 (lick) or 1 (no_lick)
+            
+        Returns:
+            observation: Next state (5D one-hot)
+            reward: Reward received
+            terminated: Whether episode is done
+            truncated: Whether episode was truncated
+            info: Additional information
+        """
+        reward = 0.0
+        terminated = False
+        truncated = False
+        
+        # Determine current trial phase
+        trial_info = self.timestep_to_trial.get(self.current_timestep)
+        
+        if trial_info:
+            # We're in a trial
+            if self.current_timestep in trial_info['stim_window']:
+                # Stimulus window: just show stimulus, no reward
+                phase = 'stim_window'
+                reward = 0.0
+                reward_available = False
+                # Move to next timestep
+                self.current_timestep += 1
+                if self.current_timestep < len(self.state_sequence):
+                    self.current_state = self.state_sequence[self.current_timestep]
+                    # Check if we've moved into reward window - if so, process action here
+                    if self.current_timestep in trial_info['reward_window']:
+                        # We've transitioned to reward window - process action in this step
+                        reward_available = self.reward_sequence[self.current_timestep] > 0
+                        current_state_idx = np.argmax(self.current_state)
+                        
+                        if current_state_idx == 3:  # reward_unknown state
+                            if action == 0:  # lick
+                                if reward_available:
+                                    reward = self.reward_lick
+                                    self.current_state = self.state_encodings['rewarded']
+                                    phase = 'outcome'
+                                else:
+                                    reward = self.lick_no_reward
+                                    self.current_state = self.state_encodings['unrewarded']
+                                    phase = 'outcome'
+                            else:  # no_lick
+                                reward = self.no_lick
+                                phase = 'reward_window'
+                        else:
+                            # Shouldn't happen, but handle it
+                            phase = 'reward_window'
+                    elif self.current_timestep in trial_info.get('iti_window', []):
+                        # Moved to ITI
+                        phase = 'iti'
+                else:
+                    terminated = True
+                    
+            elif self.current_timestep in trial_info['reward_window']:
+                # Reward availability window: starts in reward_unknown state
+                # State transitions based on action and reward availability
+                phase = 'reward_window'
+                reward_available = self.reward_sequence[self.current_timestep] > 0
+                
+                # Check current state
+                current_state_idx = np.argmax(self.current_state)
+                
+                if current_state_idx == 3:  # reward_unknown state
+                    # We're in reward_unknown - check action
+                    if action == 0:  # lick
+                        if reward_available:
+                            # Transition to rewarded outcome state
+                            reward = self.reward_lick
+                            self.current_state = self.state_encodings['rewarded']
+                            phase = 'outcome'
+                        else:
+                            # Transition to unrewarded outcome state
+                            reward = self.lick_no_reward
+                            self.current_state = self.state_encodings['unrewarded']
+                            phase = 'outcome'
+                    else:  # no_lick
+                        # Stay in reward_unknown state
+                        reward = self.no_lick
+                        self.current_state = self.state_encodings['reward_unknown']
+                
+                elif current_state_idx == 5:  # rewarded state
+                    # Already in rewarded state - continue receiving reward if licks
+                    phase = 'outcome'
+                    if action == 0:  # lick
+                        if reward_available:
+                            reward = self.reward_lick  # Continue receiving reward
+                        else:
+                            reward = self.lick_no_reward  # Reward no longer available
+                            # Transition to unrewarded if reward becomes unavailable
+                            self.current_state = self.state_encodings['unrewarded']
+                    else:  # no_lick
+                        reward = self.no_lick
+                        # Stay in rewarded state (outcome already determined)
+                
+                elif current_state_idx == 4:  # unrewarded state
+                    # Already in unrewarded state - stay here
+                    phase = 'outcome'
+                    if action == 0:  # lick
+                        reward = self.lick_no_reward  # Continue receiving punishment
+                    else:  # no_lick
+                        reward = self.no_lick
+                    # Stay in unrewarded state
+                
+                # Move to next timestep
+                self.current_timestep += 1
+                
+                # Check if we've moved past the reward window
+                if self.current_timestep not in trial_info['reward_window']:
+                    # Reset for next trial
+                    self.reward_window_action = None
+                    
+                    # Check if we're in ITI or episode is done
+                    if self.current_timestep >= len(self.state_sequence):
+                        terminated = True
+                    elif self.current_timestep in trial_info.get('iti_window', []):
+                        # Will be handled in next iteration
+                        pass
+                    else:
+                        terminated = True
+                elif self.current_timestep >= len(self.state_sequence):
+                    terminated = True
+                    
+            elif self.current_timestep in trial_info['iti_window']:
+                # ITI: no stimulus, no reward
+                phase = 'iti'
+                reward = 0.0
+                reward_available = False
+                # Move to next timestep
+                self.current_timestep += 1
+                if self.current_timestep < len(self.state_sequence):
+                    self.current_state = self.state_sequence[self.current_timestep]
+                else:
+                    terminated = True
+            else:
+                # Shouldn't happen
+                phase = 'unknown'
+                reward = 0.0
+                reward_available = False
+                self.current_timestep += 1
+                if self.current_timestep < len(self.state_sequence):
+                    self.current_state = self.state_sequence[self.current_timestep]
+                else:
+                    terminated = True
+        else:
+            # Between trials or ITI
+            phase = 'iti' if self._is_iti_state(self.current_state) else 'unknown'
+            reward = 0.0
+            reward_available = False
+            self.current_timestep += 1
+            if self.current_timestep < len(self.state_sequence):
+                self.current_state = self.state_sequence[self.current_timestep]
+            else:
+                terminated = True
+        
+        # Check if episode is done
+        if self.current_timestep >= self.max_timesteps:
+            terminated = True
+        
+        state_idx = int(np.argmax(self.current_state))
+        state_names = ['A', 'B', 'C', 'reward_unknown', 'unrewarded', 'rewarded', 'ITI']
+        
+        # Get reversal phase
+        reversal_phase = None
+        if trial_info:
+            reversal_phase = trial_info.get('reversal_phase')
+        
+        info = {
+            'timestep': self.current_timestep,
+            'action': 'lick' if action == 0 else 'no_lick',
+            'reward': reward,
+            'reward_available': reward_available,
+            'state_idx': state_idx,
+            'state_name': state_names[state_idx] if state_idx < len(state_names) else 'unknown',
+            'trial_idx': trial_info['trial_idx'] if trial_info else None,
+            'trial_phase': phase,
+            'reversal_phase': reversal_phase
+        }
+        
+        return self.current_state.copy(), reward, terminated, truncated, info
+    
+    def render(self):
+        """Render the environment."""
+        if self.render_mode == "human":
+            state_names = ['A', 'B', 'C', 'reward_unknown', 'unrewarded', 'rewarded', 'ITI']
+            state_idx = np.argmax(self.current_state)
+            state_name = state_names[state_idx] if state_idx < len(state_names) else 'unknown'
+            print(f"Timestep: {self.current_timestep}, "
+                  f"State: {state_name}, "
+                  f"Trial: {self.current_trial_idx}")
+
+
+def load_reversal_abc_multitimestep_data(data_path):
+    """
+    Load reversal ABC multi-timestep task data from pickle file.
+    
+    Args:
+        data_path: Path to pickle file containing task data
+        
+    Returns:
+        state_sequence: Array of states (N x 5)
+        reward_sequence: Array of reward availability (N x 1)
+        reversal_mask: Array indicating reversal phase (0=pre, 1=post)
+        phase_boundaries: Dict with phase boundaries
+        trial_structure: List of dicts with trial structure information
+        state_map: Dict mapping state names to indices
+    """
+    with open(data_path, "rb") as fid:
+        data = pickle.load(fid)
+    
+    state_sequence_ohe = data["state_sequence_ohe"]
+    reward_sequence = data["reward_sequence"]
+    reversal_mask = data["sequence"]["masks"]["reversal"]
+    phase_boundaries = data.get("phase_boundaries", None)
+    trial_structure = data.get("trial_structure", [])
+    state_map = data.get("state_map", None)
+    
+    return state_sequence_ohe, reward_sequence, reversal_mask, phase_boundaries, trial_structure, state_map
+
+
+def load_reversal_abc_multitimestep_multi_data(data_path):
+    """
+    Load multi-reversal ABC multi-timestep task data from pickle file.
+    
+    Args:
+        data_path: Path to pickle file containing task data
+        
+    Returns:
+        state_sequence: Array of states (N x 7)
+        reward_sequence: Array of reward availability (N,)
+        reversal_mask: Array indicating reversal phase (0, 1, 2, 3, ...)
+        phase_boundaries: Dict with phase boundaries and reversal points
+        trial_structure: List of dicts with trial structure information
+        state_map: Dict mapping state names to indices
+    """
+    with open(data_path, "rb") as fid:
+        data = pickle.load(fid)
+    
+    state_sequence_ohe = data["state_sequence_ohe"]
+    reward_sequence = data["reward_sequence"]
+    reversal_mask = data["sequence"]["masks"]["reversal"]
+    phase_boundaries = data.get("phase_boundaries", None)
+    trial_structure = data.get("trial_structure", [])
+    state_map = data.get("state_map", None)
+    
+    return state_sequence_ohe, reward_sequence, reversal_mask, phase_boundaries, trial_structure, state_map
