@@ -455,7 +455,7 @@ class MetaA2CAgent:
         """Reset the RNN hidden state."""
         self.hidden_state = None
     
-    def select_action(self, state, prev_action, prev_reward, deterministic=False, policy_clip=None):
+    def select_action(self, state, prev_action, prev_reward, deterministic=False, policy_clip=None, return_rnn_out=False):
         """
         Select an action given the current state, previous action, and previous reward.
         
@@ -465,13 +465,17 @@ class MetaA2CAgent:
             prev_reward: Previous reward (tensor)
             deterministic: If True, select greedy action. If False, sample from policy.
             policy_clip: Minimum probability for each action (prevents zero probability). If None, no clipping.
+            return_rnn_out: If True, also return the RNN output (hidden state representation).
         """
         state = state.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
         prev_action = prev_action.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
         prev_reward = prev_reward.unsqueeze(0).to(next(self.model.parameters()).device)  # Add batch dim
         
         with torch.no_grad():
-            action_probs, value, self.hidden_state = self.model(state, prev_action, prev_reward, self.hidden_state)
+            if return_rnn_out:
+                action_probs, value, self.hidden_state, rnn_out = self.model(state, prev_action, prev_reward, self.hidden_state, return_rnn_out=True)
+            else:
+                action_probs, value, self.hidden_state = self.model(state, prev_action, prev_reward, self.hidden_state)
         
         action_probs = action_probs.squeeze(0)  # Remove batch dim
         
@@ -489,6 +493,9 @@ class MetaA2CAgent:
             action = dist.sample().item()
             action_prob = action_probs[action].item()
         
+        if return_rnn_out:
+            rnn_out = rnn_out.squeeze(0)  # Remove batch dim
+            return action, action_prob, value.item(), rnn_out
         return action, action_prob, value.item()
     
     def update(self, states, prev_actions, prev_rewards, actions, rewards, next_states, next_prev_actions, next_prev_rewards, dones):

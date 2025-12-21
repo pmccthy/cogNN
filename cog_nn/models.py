@@ -79,7 +79,7 @@ class RNNActorCritic(nn.Module):
         if hook_fn is not None:
             self.rnn.register_forward_hook(hook_fn)
 
-    def forward(self, state, prev_action, prev_reward, hidden_state=None):
+    def forward(self, state, prev_action, prev_reward, hidden_state=None, return_rnn_out=False):
         # Concatenate state, previous action (one-hot), and previous reward
         x = cat([state, prev_action, prev_reward.unsqueeze(-1)], dim=-1).unsqueeze(1)  # add seq dim
         rnn_out, hidden_state = self.rnn(x, hidden_state)  # rnn_out shape: (batch, seq=1, hidden)
@@ -92,6 +92,8 @@ class RNNActorCritic(nn.Module):
         # Critic head
         value = self.critic_fc(rnn_out)
 
+        if return_rnn_out:
+            return action_probs, value, hidden_state, rnn_out
         return action_probs, value, hidden_state
     
 class SelfSupervisedRNNActorCritic(nn.Module):
