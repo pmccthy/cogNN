@@ -96,6 +96,61 @@ class RNNActorCritic(nn.Module):
             return action_probs, value, hidden_state, rnn_out
         return action_probs, value, hidden_state
     
+class RNNActorCriticPartialReadout(nn.Module):
+    """
+    Actor-Critic with shared RNN backbone where only a subset of recurrent neurons
+    project to the actor and critic heads.  The remaining neurons participate fully
+    in RNN dynamics but do not contribute to the policy/value readout.
+
+    This is identical to RNNActorCritic except that actor_fc and critic_fc receive
+    input from `readout_indices` neurons only (same set for both heads).
+
+    Args:
+        state_size:      Current state dimension.
+        action_size:     Number of discrete actions.
+        hidden_size:     Total RNN hidden state dimension (default 128).
+        readout_indices: List of integer indices into the hidden state that project
+                         to actor/critic.  If None, the first hidden_size//2 neurons
+                         are used (i.e. the "projecting" population is the first half).
+        hook_fn:         Optional forward hook registered on the RNN.
+    """
+
+    def __init__(self, state_size, action_size, hidden_size=128,
+                 readout_indices=None, hook_fn=None):
+        super(RNNActorCriticPartialReadout, self).__init__()
+
+        if readout_indices is None:
+            readout_indices = list(range(hidden_size // 2))
+        self.readout_indices = readout_indices
+        readout_size = len(readout_indices)
+
+        self.rnn = RNN(input_size=state_size + action_size + 1,
+                       hidden_size=hidden_size,
+                       batch_first=True)
+        self.actor_fc = nn.Linear(readout_size, action_size)
+        self.critic_fc = nn.Linear(readout_size, 1)
+        self.softmax = nn.Softmax(dim=-1)
+
+        if hook_fn is not None:
+            self.rnn.register_forward_hook(hook_fn)
+
+    def forward(self, state, prev_action, prev_reward, hidden_state=None, return_rnn_out=False):
+        x = cat([state, prev_action, prev_reward.unsqueeze(-1)], dim=-1).unsqueeze(1)
+        rnn_out, hidden_state = self.rnn(x, hidden_state)
+        rnn_out = rnn_out.squeeze(1)  # (batch, hidden_size)
+
+        # Select projecting neurons for readout
+        readout = rnn_out[:, self.readout_indices]
+
+        action_logits = self.actor_fc(readout)
+        action_probs = self.softmax(action_logits)
+        value = self.critic_fc(readout)
+
+        if return_rnn_out:
+            return action_probs, value, hidden_state, rnn_out
+        return action_probs, value, hidden_state
+
+
 class SelfSupervisedRNNActorCritic(nn.Module):
     """
     Combined Actor-Critic model with shared RNN backbone and self-supervised readout, with RNN receiving current state and previous action as input, and predicting next state.
