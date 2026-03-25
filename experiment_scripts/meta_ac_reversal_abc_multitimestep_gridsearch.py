@@ -1,0 +1,642 @@
+"""
+Perform grid search over parameters for MetaA2C agent in Reversal ABC Multi-Timestep environment.
+Author: patrick.mccarthy@dpag.ox.ac.uk
+"""
+
+import sys
+from pathlib import Path
+import pickle
+import torch
+from torch.optim import Adam
+import numpy as np
+from itertools import product
+import json
+from datetime import datetime
+import random
+from pprint import pprint
+
+# Set random seeds for reproducibility
+RANDOM_SEED = 42
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# Add parent directory to path for imports
+sys.path.append(str(Path(__file__).parent.parent))
+
+from cog_nn.tasks.reversal_envs import ReversalABCMultiTimestepEnv, load_reversal_abc_multitimestep_data
+from cog_nn.agents import MetaA2CAgent
+
+# All parameters - if a list has only one element, it's treated as fixed (not searched)
+# If a list has multiple elements, all combinations will be searched
+all_params = {
+    "learning_rate": [0.0005, 0.001],
+    "gamma": [0, 0.5],
+    "hidden_size": [64, 128],
+    "batch_size": [1],  # Fixed - only one value
+    "reward_lick": [1.0],  # Reward when reward is available and agent licks
+    "lick_no_reward": [0., -0.5, -1.0],  # Reward when no reward available but agent licks
+    "no_lick": [0.0],  # Reward when agent doesn't lick
+    "policy_clip": [None, 0.25],  # Policy clipping parameter for select_action
+}
+
+# Number of runs per parameter combination
+num_runs_per_combination = 5
+
+# Paths and task configuration
+task_data_path = Path("/Users/pmccarthy/Documents/cogNN/task_data")
+task = "reversal_abc_multitimestep"
+results_dir = Path("/Users/pmccarthy/Documents/modelling_results/january_2026_meta_ac/meta_ac_reversal_abc_multitimestep_gridsearch")
+
+# Create results directory
+results_dir.mkdir(parents=True, exist_ok=True)
+
+# Load task data
+print("Loading task data...")
+data_path = Path(task_data_path, f"{task}.pkl")
+state_sequence, reward_sequence, reversal_mask, phase_boundaries, trial_structure, state_map = \
+    load_reversal_abc_multitimestep_data(data_path)
+print(f"Loaded data from {data_path}")
+print(f"State sequence shape: {state_sequence.shape}")
+print(f"Reward sequence shape: {reward_sequence.shape}")
+print(f"Number of trials: {len(trial_structure)}")
+if phase_boundaries:
+    print(f"Phase boundaries: {phase_boundaries}")
+    print(f"Reversal points (timesteps): {phase_boundaries.get('reversal_points', [])}")
+
+original_state_sequence = state_sequence.copy()
+original_reward_sequence = reward_sequence.copy()
+original_reversal_mask = reversal_mask.copy() if reversal_mask is not None else None
+
+# Get state and action sizes
+state_size = state_sequence.shape[1]
+action_size = 2
+
+# Get phase boundaries
+pre_start = phase_boundaries['pre_reversal']['start']
+pre_end = phase_boundaries['pre_reversal']['end']
+post_start = phase_boundaries['post_reversal']['start']
+post_end = phase_boundaries['post_reversal']['end']
+reversal_points = phase_boundaries.get('reversal_points', [])
+
+print(f"\nTraining setup:")
+print(f"Pre-reversal phase: timesteps {pre_start} to {pre_end}")
+print(f"Post-reversal phase: timesteps {post_start} to {post_end}")
+print(f"Reversal points: {reversal_points}")
+
+# Separate grid search params (multiple values) from fixed params (single value)
+grid_params = {k: v for k, v in all_params.items() if len(v) > 1}
+fixed_params = {k: v[0] for k, v in all_params.items() if len(v) == 1}
+
+print(f"\nAll parameters: {all_params}")
+print(f"Grid search parameters (multiple values): {grid_params}")
+print(f"Fixed parameters (single value): {fixed_params}")
+
+# Generate all parameter combinations for grid search params
+if grid_params:
+    grid_param_names = list(grid_params.keys())
+    grid_param_values = list(grid_params.values())
+    grid_combinations = list(product(*grid_param_values))
+    
+    # Create full parameter combinations by adding fixed params to each grid combination
+    param_combinations = []
+    for grid_combo in grid_combinations:
+        full_combo = dict(zip(grid_param_names, grid_combo))
+        full_combo.update(fixed_params)  # Add fixed params
+        param_combinations.append(full_combo)
+else:
+    # No grid search, just use fixed params
+    param_combinations = [fixed_params.copy()]
+
+print(f"\nTotal parameter combinations: {len(param_combinations)}")
+
+# Save grid search configuration
+config = {
+    "all_params": all_params,
+    "grid_params": grid_params,
+    "fixed_params": fixed_params,
+    "task_config": {
+        "task": task,
+        "state_size": state_size,
+        "action_size": action_size,
+        "pre_start": pre_start,
+        "pre_end": pre_end,
+        "post_start": post_start,
+        "post_end": post_end,
+        "reversal_points": reversal_points,
+    },
+    "num_combinations": len(param_combinations),
+    "num_runs_per_combination": num_runs_per_combination,
+    "timestamp": datetime.now().isoformat(),
+}
+
+with open(results_dir / "gridsearch_config.json", "w") as f:
+    json.dump(config, f, indent=2)
+
+# Training function
+def train_model(params_dict, run_id, total_runs):
+    """Train a single model with given parameters."""
+    print(f"\n{'='*60}")
+    print(f"Training model {run_id}/{total_runs}")
+    print("Parameters:")
+    pprint(params_dict)
+    print(f"{'='*60}")
+    
+    # Extract parameters
+    learning_rate = params_dict["learning_rate"]
+    gamma = params_dict["gamma"]
+    hidden_size = params_dict["hidden_size"]
+    batch_size = params_dict.get("batch_size", 1)
+    reward_lick = params_dict.get("reward_lick", 1.0)
+    lick_no_reward = params_dict.get("lick_no_reward", -2.0)
+    no_lick = params_dict.get("no_lick", 0.0)
+    policy_clip = params_dict.get("policy_clip", None)
+    
+    # Create MetaA2C agent
+    agent = MetaA2CAgent(state_size=state_size, action_size=action_size, hidden_size=hidden_size)
+    
+    # Add optimizer and gamma to the model (required by update method)
+    agent.model.optimizer = Adam(agent.model.parameters(), lr=learning_rate)
+    agent.model.gamma = gamma
+    
+    # Set model to training mode
+    agent.model.train()
+    
+    if not np.array_equal(state_sequence, original_state_sequence):
+        print(f"WARNING: state_sequence has been modified!")
+    if not np.array_equal(reward_sequence, original_reward_sequence):
+        print(f"WARNING: reward_sequence has been modified!")
+    if reversal_mask is not None and original_reversal_mask is not None:
+        if not np.array_equal(reversal_mask, original_reversal_mask):
+            print(f"WARNING: reversal_mask has been modified!")
+    
+    # Reset environment
+    env = ReversalABCMultiTimestepEnv(
+        state_sequence,
+        reward_sequence,
+        reversal_mask,
+        trial_structure,
+        reward_lick=reward_lick,
+        lick_no_reward=lick_no_reward,
+        no_lick=no_lick,
+        state_map=state_map
+    )
+    obs, info = env.reset()
+    
+    # Initialize previous action and reward tracking
+    prev_action = torch.zeros(action_size)  # One-hot encoding
+    prev_reward = torch.tensor(0.0)
+    
+    # Reset hidden state
+    agent.reset_hidden_state()
+    
+    # Track metrics during training
+    metrics = {
+        'lick_probs': {'A': [], 'B': [], 'C': []},
+        'values': {'A': [], 'B': [], 'C': []},
+        'rewards': [],
+        'reward_timesteps': [],
+        'timesteps_A': [],
+        'timesteps_B': [],
+        'timesteps_C': [],
+        # Track within-trial metrics
+        'trial_lick_probs': {'A': [], 'B': [], 'C': []},
+        'trial_values': {'A': [], 'B': [], 'C': []},
+        'trial_timesteps': [],
+        'trial_indices': [],
+        'trial_reversal_phases': [],
+        # Track trial boundaries
+        'trial_boundaries': [],
+        # Track within-trial dynamics
+        'within_trial_lick_probs': {},
+        'within_trial_values': {},
+        'within_trial_timesteps': {},
+        'within_trial_states': {},
+    }
+    
+    # Track states, actions, rewards for batch update
+    states_batch = []
+    prev_actions_batch = []
+    prev_rewards_batch = []
+    actions_batch = []
+    rewards_batch = []
+    next_states_batch = []
+    next_prev_actions_batch = []
+    next_prev_rewards_batch = []
+    dones_batch = []
+    
+    # Train on pre-reversal phase
+    print(f"Phase 1: Pre-reversal (timesteps {pre_start} to {pre_end})")
+    
+    for t_idx in range(pre_start, pre_end):
+        if t_idx % 1000 == 0:
+            print(f"  Timestep {t_idx}/{pre_end}")
+        
+        # Get current state
+        state = torch.from_numpy(obs).float()
+        
+        # Check if we're at a stimulus state BEFORE stepping
+        state_idx_before_step = np.argmax(obs)
+        is_stimulus_state = state_idx_before_step in [0, 1, 2]  # A, B, or C
+        
+        # Select action (MetaA2C requires prev_action and prev_reward)
+        action, action_prob, value = agent.select_action(state, prev_action, prev_reward, deterministic=False, policy_clip=policy_clip)
+        
+        # Step environment
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        
+        # Get actual environment timestep
+        env_timestep = info.get('timestep', t_idx)
+        
+        # Store for batch update
+        states_batch.append(obs)
+        prev_actions_batch.append(prev_action.numpy())
+        prev_rewards_batch.append(prev_reward.item())
+        actions_batch.append(action)
+        rewards_batch.append(reward)
+        next_states_batch.append(next_obs)
+        # Create next prev_action (one-hot) and prev_reward
+        next_prev_action = torch.zeros(action_size)
+        next_prev_action[action] = 1.0
+        next_prev_actions_batch.append(next_prev_action.numpy())
+        next_prev_rewards_batch.append(reward)
+        dones_batch.append(done)
+        
+        # Track metrics
+        state_idx = state_idx_before_step
+        trial_info = info.get('trial_idx')
+        
+        # Track trial boundaries
+        if trial_info is not None:
+            trial_data = trial_structure[trial_info]
+            if t_idx == trial_data['trial_start']:
+                metrics['trial_boundaries'].append({
+                    'trial_idx': trial_info,
+                    'trial_start': trial_data['trial_start'],
+                    'trial_end': trial_data['trial_end'],
+                    'stimulus': trial_data['stimulus'],
+                    'reversal_phase': trial_data['reversal_phase'],
+                    'reward_available': trial_data['reward_available']
+                })
+                # Initialize within-trial tracking
+                metrics['within_trial_lick_probs'][trial_info] = []
+                metrics['within_trial_values'][trial_info] = []
+                metrics['within_trial_timesteps'][trial_info] = []
+                metrics['within_trial_states'][trial_info] = []
+            
+            # Track within-trial dynamics
+            if trial_info in metrics['within_trial_lick_probs']:
+                metrics['within_trial_lick_probs'][trial_info].append(action_prob if action == 0 else 1 - action_prob)
+                metrics['within_trial_values'][trial_info].append(value)
+                metrics['within_trial_timesteps'][trial_info].append(env_timestep)
+                state_name = info.get('state_name', 'unknown')
+                metrics['within_trial_states'][trial_info].append(state_name)
+        
+        # Track at last timestep of stim window for each trial
+        if trial_info is not None:
+            trial_data = trial_structure[trial_info]
+            if t_idx == trial_data['stim_window'][-1]:
+                if state_idx == 0:  # A
+                    metrics['trial_lick_probs']['A'].append(action_prob if action == 0 else 1 - action_prob)
+                    metrics['trial_values']['A'].append(value)
+                elif state_idx == 1:  # B
+                    metrics['trial_lick_probs']['B'].append(action_prob if action == 0 else 1 - action_prob)
+                    metrics['trial_values']['B'].append(value)
+                elif state_idx == 2:  # C
+                    metrics['trial_lick_probs']['C'].append(action_prob if action == 0 else 1 - action_prob)
+                    metrics['trial_values']['C'].append(value)
+                
+                metrics['trial_timesteps'].append(env_timestep)
+                metrics['trial_indices'].append(trial_info)
+                metrics['trial_reversal_phases'].append(trial_data['reversal_phase'])
+        
+        # Track all stimulus states
+        if state_idx == 0:  # A
+            metrics['lick_probs']['A'].append(action_prob if action == 0 else 1 - action_prob)
+            metrics['values']['A'].append(value)
+            metrics['timesteps_A'].append(env_timestep)
+        elif state_idx == 1:  # B
+            metrics['lick_probs']['B'].append(action_prob if action == 0 else 1 - action_prob)
+            metrics['values']['B'].append(value)
+            metrics['timesteps_B'].append(env_timestep)
+        elif state_idx == 2:  # C
+            metrics['lick_probs']['C'].append(action_prob if action == 0 else 1 - action_prob)
+            metrics['values']['C'].append(value)
+            metrics['timesteps_C'].append(env_timestep)
+        
+        # Track rewards
+        if info.get('reward_available', False):
+            metrics['rewards'].append(reward)
+            metrics['reward_timesteps'].append(env_timestep)
+        
+        obs = next_obs
+        
+        # Update prev_action and prev_reward for next iteration
+        prev_action = next_prev_action
+        prev_reward = torch.tensor(reward, dtype=torch.float32)
+        
+        # Batch update
+        if len(states_batch) >= batch_size:
+            agent.update(
+                torch.from_numpy(np.array(states_batch)).float(),
+                torch.from_numpy(np.array(prev_actions_batch)).float(),
+                torch.from_numpy(np.array(prev_rewards_batch)).float(),
+                torch.from_numpy(np.array(actions_batch)).long(),
+                torch.from_numpy(np.array(rewards_batch)).float(),
+                torch.from_numpy(np.array(next_states_batch)).float(),
+                torch.from_numpy(np.array(next_prev_actions_batch)).float(),
+                torch.from_numpy(np.array(next_prev_rewards_batch)).float(),
+                torch.from_numpy(np.array(dones_batch)).float()
+            )
+            # Clear batch
+            states_batch = []
+            prev_actions_batch = []
+            prev_rewards_batch = []
+            actions_batch = []
+            rewards_batch = []
+            next_states_batch = []
+            next_prev_actions_batch = []
+            next_prev_rewards_batch = []
+            dones_batch = []
+    
+    # Train on post-reversal phase
+    print(f"Phase 2: Post-reversal (timesteps {post_start} to {post_end})")
+    
+    for t_idx in range(post_start, post_end):
+        if (t_idx - post_start) % 1000 == 0:
+            print(f"  Timestep {t_idx}/{post_end}")
+        
+        # Get current state
+        state = torch.from_numpy(obs).float()
+        
+        # Check if we're at a stimulus state BEFORE stepping
+        state_idx_before_step = np.argmax(obs)
+        is_stimulus_state = state_idx_before_step in [0, 1, 2]  # A, B, or C
+        
+        # Select action (MetaA2C requires prev_action and prev_reward)
+        action, action_prob, value = agent.select_action(state, prev_action, prev_reward, deterministic=False, policy_clip=policy_clip)
+        
+        # Step environment
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        
+        # Get actual environment timestep
+        env_timestep = info.get('timestep', t_idx)
+        
+        # Store for batch update
+        states_batch.append(obs)
+        prev_actions_batch.append(prev_action.numpy())
+        prev_rewards_batch.append(prev_reward.item())
+        actions_batch.append(action)
+        rewards_batch.append(reward)
+        next_states_batch.append(next_obs)
+        # Create next prev_action (one-hot) and prev_reward
+        next_prev_action = torch.zeros(action_size)
+        next_prev_action[action] = 1.0
+        next_prev_actions_batch.append(next_prev_action.numpy())
+        next_prev_rewards_batch.append(reward)
+        dones_batch.append(done)
+        
+        # Track metrics (same as pre-reversal)
+        state_idx = state_idx_before_step
+        trial_info = info.get('trial_idx')
+        
+        # Track trial boundaries
+        if trial_info is not None:
+            trial_data = trial_structure[trial_info]
+            if t_idx == trial_data['trial_start']:
+                metrics['trial_boundaries'].append({
+                    'trial_idx': trial_info,
+                    'trial_start': trial_data['trial_start'],
+                    'trial_end': trial_data['trial_end'],
+                    'stimulus': trial_data['stimulus'],
+                    'reversal_phase': trial_data['reversal_phase'],
+                    'reward_available': trial_data['reward_available']
+                })
+                # Initialize within-trial tracking
+                metrics['within_trial_lick_probs'][trial_info] = []
+                metrics['within_trial_values'][trial_info] = []
+                metrics['within_trial_timesteps'][trial_info] = []
+                metrics['within_trial_states'][trial_info] = []
+            
+            # Track within-trial dynamics
+            if trial_info in metrics['within_trial_lick_probs']:
+                metrics['within_trial_lick_probs'][trial_info].append(action_prob if action == 0 else 1 - action_prob)
+                metrics['within_trial_values'][trial_info].append(value)
+                metrics['within_trial_timesteps'][trial_info].append(env_timestep)
+                state_name = info.get('state_name', 'unknown')
+                metrics['within_trial_states'][trial_info].append(state_name)
+        
+        # Track at last timestep of stim window for each trial
+        if trial_info is not None:
+            trial_data = trial_structure[trial_info]
+            if t_idx == trial_data['stim_window'][-1]:
+                if state_idx == 0:  # A
+                    metrics['trial_lick_probs']['A'].append(action_prob if action == 0 else 1 - action_prob)
+                    metrics['trial_values']['A'].append(value)
+                elif state_idx == 1:  # B
+                    metrics['trial_lick_probs']['B'].append(action_prob if action == 0 else 1 - action_prob)
+                    metrics['trial_values']['B'].append(value)
+                elif state_idx == 2:  # C
+                    metrics['trial_lick_probs']['C'].append(action_prob if action == 0 else 1 - action_prob)
+                    metrics['trial_values']['C'].append(value)
+                
+                metrics['trial_timesteps'].append(env_timestep)
+                metrics['trial_indices'].append(trial_info)
+                metrics['trial_reversal_phases'].append(trial_data['reversal_phase'])
+        
+        if state_idx == 0:  # A
+            metrics['lick_probs']['A'].append(action_prob if action == 0 else 1 - action_prob)
+            metrics['values']['A'].append(value)
+            metrics['timesteps_A'].append(env_timestep)
+        elif state_idx == 1:  # B
+            metrics['lick_probs']['B'].append(action_prob if action == 0 else 1 - action_prob)
+            metrics['values']['B'].append(value)
+            metrics['timesteps_B'].append(env_timestep)
+        elif state_idx == 2:  # C
+            metrics['lick_probs']['C'].append(action_prob if action == 0 else 1 - action_prob)
+            metrics['values']['C'].append(value)
+            metrics['timesteps_C'].append(env_timestep)
+        
+        # Track rewards
+        if info.get('reward_available', False):
+            metrics['rewards'].append(reward)
+            metrics['reward_timesteps'].append(env_timestep)
+        
+        obs = next_obs
+        
+        # Update prev_action and prev_reward for next iteration
+        prev_action = next_prev_action
+        prev_reward = torch.tensor(reward, dtype=torch.float32)
+        
+        # Batch update
+        if len(states_batch) >= batch_size:
+            agent.update(
+                torch.from_numpy(np.array(states_batch)).float(),
+                torch.from_numpy(np.array(prev_actions_batch)).float(),
+                torch.from_numpy(np.array(prev_rewards_batch)).float(),
+                torch.from_numpy(np.array(actions_batch)).long(),
+                torch.from_numpy(np.array(rewards_batch)).float(),
+                torch.from_numpy(np.array(next_states_batch)).float(),
+                torch.from_numpy(np.array(next_prev_actions_batch)).float(),
+                torch.from_numpy(np.array(next_prev_rewards_batch)).float(),
+                torch.from_numpy(np.array(dones_batch)).float()
+            )
+            # Clear batch
+            states_batch = []
+            prev_actions_batch = []
+            prev_rewards_batch = []
+            actions_batch = []
+            rewards_batch = []
+            next_states_batch = []
+            next_prev_actions_batch = []
+            next_prev_rewards_batch = []
+            dones_batch = []
+    
+    # Final update with remaining batch
+    if len(states_batch) > 0:
+        agent.update(
+            torch.from_numpy(np.array(states_batch)).float(),
+            torch.from_numpy(np.array(prev_actions_batch)).float(),
+            torch.from_numpy(np.array(prev_rewards_batch)).float(),
+            torch.from_numpy(np.array(actions_batch)).long(),
+            torch.from_numpy(np.array(rewards_batch)).float(),
+            torch.from_numpy(np.array(next_states_batch)).float(),
+            torch.from_numpy(np.array(next_prev_actions_batch)).float(),
+            torch.from_numpy(np.array(next_prev_rewards_batch)).float(),
+            torch.from_numpy(np.array(dones_batch)).float()
+        )
+    
+    print(f"Training complete!")
+    print(f"Total rewards collected: {len(metrics['rewards'])}")
+    
+    # Convert metrics to numpy arrays for saving
+    metrics_numpy = {
+        'lick_probs': {
+            'A': np.array(metrics['lick_probs']['A']),
+            'B': np.array(metrics['lick_probs']['B']),
+            'C': np.array(metrics['lick_probs']['C'])
+        },
+        'values': {
+            'A': np.array(metrics['values']['A']),
+            'B': np.array(metrics['values']['B']),
+            'C': np.array(metrics['values']['C'])
+        },
+        'rewards': np.array(metrics['rewards']),
+        'reward_timesteps': np.array(metrics['reward_timesteps']),
+        'timesteps_A': np.array(metrics['timesteps_A']),
+        'timesteps_B': np.array(metrics['timesteps_B']),
+        'timesteps_C': np.array(metrics['timesteps_C']),
+        'trial_lick_probs': {
+            'A': np.array(metrics['trial_lick_probs']['A']),
+            'B': np.array(metrics['trial_lick_probs']['B']),
+            'C': np.array(metrics['trial_lick_probs']['C'])
+        },
+        'trial_values': {
+            'A': np.array(metrics['trial_values']['A']),
+            'B': np.array(metrics['trial_values']['B']),
+            'C': np.array(metrics['trial_values']['C'])
+        },
+        'trial_timesteps': np.array(metrics['trial_timesteps']),
+        'trial_indices': np.array(metrics['trial_indices']),
+        'trial_reversal_phases': np.array(metrics['trial_reversal_phases']),
+        'trial_boundaries': metrics['trial_boundaries'],
+        'within_trial_lick_probs': metrics['within_trial_lick_probs'],
+        'within_trial_values': metrics['within_trial_values'],
+        'within_trial_timesteps': metrics['within_trial_timesteps'],
+        'within_trial_states': metrics['within_trial_states'],
+    }
+    
+    return metrics_numpy, params_dict, agent
+
+# Run grid search
+print(f"\n{'='*60}")
+print("Starting grid search...")
+print(f"{'='*60}")
+
+# Calculate total number of runs
+total_runs = len(param_combinations) * num_runs_per_combination
+print(f"Total runs to execute: {total_runs} ({len(param_combinations)} combinations × {num_runs_per_combination} runs each)")
+
+results = []
+total_run_id = 0
+for combo_id, params_dict in enumerate(param_combinations, 1):
+    print(f"\n{'='*60}")
+    print(f"Parameter combination {combo_id}/{len(param_combinations)}")
+    print("Parameters:")
+    pprint(params_dict)
+    print(f"Running {num_runs_per_combination} run(s) for this combination")
+    print(f"{'='*60}")
+    
+    # Run multiple times for this parameter combination
+    for run_idx in range(num_runs_per_combination):
+        total_run_id += 1
+        
+        # Reset random seed for each run to get different initializations
+        # Use combination ID and run index to create unique seed
+        run_seed = RANDOM_SEED + combo_id * 1000 + run_idx
+        torch.manual_seed(run_seed)
+        np.random.seed(run_seed)
+        random.seed(run_seed)
+        
+        # Create unique filename for this run
+        param_str = "_".join([f"{k}_{v}" for k, v in sorted(params_dict.items())])
+        param_str = param_str.replace(".", "_")  # Replace dots with underscores for filenames
+        
+        if num_runs_per_combination > 1:
+            run_dir = results_dir / f"combo_{combo_id:04d}_run_{run_idx+1:02d}_{param_str}"
+        else:
+            run_dir = results_dir / f"run_{total_run_id:04d}_{param_str}"
+        run_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Train model
+            print(f"\n  Run {run_idx+1}/{num_runs_per_combination} (total run {total_run_id}/{total_runs}, seed={run_seed})")
+            metrics, params, agent = train_model(params_dict, total_run_id, total_runs)
+            
+            # Save metrics
+            metrics_file = run_dir / "metrics.pkl"
+            with open(metrics_file, "wb") as f:
+                pickle.dump(metrics, f)
+            
+            # Save parameters
+            params_file = run_dir / "params.json"
+            with open(params_file, "w") as f:
+                json.dump(params, f, indent=2)
+            
+            # Save model state dict
+            torch.save(agent.model.state_dict(), run_dir / "model.pth")
+            
+            results.append({
+                "combo_id": combo_id,
+                "run_idx": run_idx,
+                "total_run_id": total_run_id,
+                "params": params,
+                "metrics_file": str(metrics_file),
+                "params_file": str(params_file),
+                "run_dir": str(run_dir),
+            })
+            
+            print(f"  Saved results to {run_dir}")
+            
+        except Exception as e:
+            print(f"  Error training run {run_idx+1} for combination {combo_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+# Save summary of all runs
+summary_file = results_dir / "gridsearch_summary.json"
+with open(summary_file, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\n{'='*60}")
+print(f"Grid search complete!")
+print(f"Total parameter combinations: {len(param_combinations)}")
+print(f"Runs per combination: {num_runs_per_combination}")
+print(f"Total runs completed: {len(results)}/{len(param_combinations) * num_runs_per_combination}")
+print(f"Results saved to: {results_dir}")
+print(f"Summary saved to: {summary_file}")
+print(f"{'='*60}")
+
