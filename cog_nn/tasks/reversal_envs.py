@@ -848,7 +848,7 @@ class ReversalABCDynamicEnv(gym.Env):
     Does not require pre-generated sequences. Instead, generates stimuli and
     determines rewards on-the-fly based on reward contingencies:
     - A: Always rewarded (1.0) when agent licks (pre-reversal), never (post-reversal)
-    - B: Never rewarded (pre-reversal), rewarded 50% of the time (post-reversal)
+    - B: Never rewarded (pre-reversal), always rewarded (post-reversal)
     - C: Rewarded 50% of the time (doesn't reverse)
     
     Supports reversal learning with pre-reversal and post-reversal phases.
@@ -982,11 +982,11 @@ class ReversalABCDynamicEnv(gym.Env):
             # A: Always rewarded in pre-reversal, never in post-reversal
             return is_pre_reversal
         elif stimulus == 'B':
-            # B: Never rewarded in pre-reversal, 50% in post-reversal
+            # B: Never rewarded in pre-reversal, always rewarded in post-reversal
             if is_pre_reversal:
                 return False
             else:
-                return self.b_reward_outcomes.get(self.current_trial, False)
+                return True
         elif stimulus == 'C':
             # C: Always 50% rewarded (doesn't reverse)
             return self.c_reward_outcomes.get(self.current_trial, False)
@@ -1531,6 +1531,378 @@ def load_reversal_abc_multitimestep_data(data_path):
     trial_structure = data.get("trial_structure", [])
     state_map = data.get("state_map", None)
     
+    return state_sequence_ohe, reward_sequence, reversal_mask, phase_boundaries, trial_structure, state_map
+
+
+class ReversalABCDEFMultiTimestepEnv(gym.Env):
+    """
+    Reversal ABCDEF task environment with multi-timestep trial structure (6 stimuli).
+
+    Stimuli are grouped into three reward classes:
+    - Group 1 (A, B): 100% rewarded pre-reversal
+    - Group 2 (C, D): 50% rewarded (never reverses)
+    - Group 3 (E, F): 0% rewarded pre-reversal
+
+    Two reversal types are supported (determined at task-generation time):
+    - Full reversal: both A and B swap with both E and F
+    - Partial reversal: only one pair swaps (e.g. A↔E), B and F unchanged
+
+    States (one-hot encoded, 10D):
+    - A:              [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    - B:              [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+    - C:              [0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+    - D:              [0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+    - E:              [0, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+    - F:              [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+    - reward_unknown: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+    - unrewarded:     [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+    - rewarded:       [0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+    - ITI:            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+
+    Actions:
+    - 0: lick
+    - 1: no_lick
+    """
+
+    metadata = {"render_modes": ["human"], "render_fps": 4}
+
+    _STATE_DIM = 10
+    _N_STIMULI = 6
+    _IDX_REWARD_UNKNOWN = 6
+    _IDX_UNREWARDED = 7
+    _IDX_REWARDED = 8
+    _IDX_ITI = 9
+    _STATE_NAMES = ['A', 'B', 'C', 'D', 'E', 'F',
+                    'reward_unknown', 'unrewarded', 'rewarded', 'ITI']
+
+    def __init__(self, state_sequence=None, reward_sequence=None, reversal_mask=None,
+                 trial_structure=None, reward_lick=1.0, lick_no_reward=-1.0, no_lick=0.0,
+                 render_mode=None, state_map=None):
+        super().__init__()
+
+        self.reward_lick = reward_lick
+        self.lick_no_reward = lick_no_reward
+        self.no_lick = no_lick
+
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(self._STATE_DIM,), dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(2)
+
+        # Build default state encodings
+        default_state_encodings = {}
+        for i, name in enumerate(self._STATE_NAMES):
+            vec = np.zeros(self._STATE_DIM, dtype=np.float32)
+            vec[i] = 1.0
+            default_state_encodings[name] = vec
+
+        if state_map is not None:
+            self.state_encodings = {}
+            for key, value in state_map.items():
+                if isinstance(value, (list, tuple)):
+                    val_array = np.array(value, dtype=np.float32)
+                elif isinstance(value, np.ndarray):
+                    val_array = value.astype(np.float32)
+                else:
+                    val_array = np.array(value, dtype=np.float32)
+                # If scalar index, convert to one-hot
+                if val_array.ndim == 0 or (val_array.ndim == 1 and len(val_array) == 1):
+                    idx = int(val_array.item() if val_array.ndim == 0 else val_array[0])
+                    one_hot = np.zeros(self._STATE_DIM, dtype=np.float32)
+                    if 0 <= idx < self._STATE_DIM:
+                        one_hot[idx] = 1.0
+                    self.state_encodings[key] = one_hot
+                else:
+                    self.state_encodings[key] = val_array
+            for key, value in default_state_encodings.items():
+                if key not in self.state_encodings:
+                    self.state_encodings[key] = value
+        else:
+            self.state_encodings = default_state_encodings
+
+        if state_sequence is None:
+            raise ValueError("state_sequence must be provided")
+        self.state_sequence = np.array(state_sequence, dtype=np.float32)
+
+        if self.state_sequence.shape[1] != self.observation_space.shape[0]:
+            raise ValueError(
+                f"State sequence dimension ({self.state_sequence.shape[1]}) does not match "
+                f"observation space dimension ({self.observation_space.shape[0]})."
+            )
+
+        if reward_sequence is None:
+            raise ValueError("reward_sequence must be provided")
+        self.reward_sequence = np.array(reward_sequence, dtype=np.float32)
+        if self.reward_sequence.ndim > 1:
+            self.reward_sequence = self.reward_sequence.flatten()
+
+        if len(self.state_sequence) != len(self.reward_sequence):
+            raise ValueError("state_sequence and reward_sequence must have same length")
+
+        self.trial_structure = trial_structure if trial_structure is not None else []
+
+        self.timestep_to_trial = {}
+        if self.trial_structure:
+            for trial_info in self.trial_structure:
+                for t in trial_info['stim_window'] + trial_info['reward_window']:
+                    self.timestep_to_trial[t] = trial_info
+                if 'iti_window' in trial_info:
+                    for t in trial_info['iti_window']:
+                        self.timestep_to_trial[t] = trial_info
+
+        self.reversal_mask = np.array(reversal_mask) if reversal_mask is not None else None
+        self.render_mode = render_mode
+
+        self.current_timestep = 0
+        self.max_timesteps = len(self.state_sequence) - 1
+        self.current_trial_idx = None
+        self.reward_window_action = None
+        self.in_outcome_state = False
+        self.outcome_state = None
+
+    # ------------------------------------------------------------------
+    # State-type helpers
+    # ------------------------------------------------------------------
+    def _is_stimulus_state(self, state):
+        return int(np.argmax(state)) < self._N_STIMULI
+
+    def _is_outcome_state(self, state):
+        return int(np.argmax(state)) in [
+            self._IDX_REWARD_UNKNOWN, self._IDX_UNREWARDED, self._IDX_REWARDED
+        ]
+
+    def _is_reward_unknown_state(self, state):
+        return int(np.argmax(state)) == self._IDX_REWARD_UNKNOWN
+
+    def _is_iti_state(self, state):
+        return int(np.argmax(state)) == self._IDX_ITI
+
+    # ------------------------------------------------------------------
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        self.current_timestep = 0
+        self.current_trial_idx = None
+        self.reward_window_action = None
+        self.in_outcome_state = False
+        self.outcome_state = None
+
+        self.current_state = self.state_sequence[0]
+        state_idx = int(np.argmax(self.current_state))
+
+        info = {
+            'timestep': self.current_timestep,
+            'state_idx': state_idx,
+            'state_name': (self._STATE_NAMES[state_idx]
+                           if state_idx < len(self._STATE_NAMES) else 'unknown'),
+            'trial_idx': None,
+            'trial_phase': None,
+        }
+        return self.current_state.copy(), info
+
+    def step(self, action):
+        reward = 0.0
+        terminated = False
+        truncated = False
+
+        trial_info = self.timestep_to_trial.get(self.current_timestep)
+
+        if trial_info:
+            if self.current_timestep in trial_info['stim_window']:
+                phase = 'stim_window'
+                reward = 0.0
+                reward_available = False
+                self.current_timestep += 1
+                if self.current_timestep < len(self.state_sequence):
+                    self.current_state = self.state_sequence[self.current_timestep]
+                    if self.current_timestep in trial_info['reward_window']:
+                        reward_available = self.reward_sequence[self.current_timestep] > 0
+                        current_state_idx = int(np.argmax(self.current_state))
+                        if current_state_idx == self._IDX_REWARD_UNKNOWN:
+                            if action == 0:
+                                if reward_available:
+                                    reward = self.reward_lick
+                                    self.current_state = self.state_encodings['rewarded']
+                                    phase = 'outcome'
+                                else:
+                                    reward = self.lick_no_reward
+                                    self.current_state = self.state_encodings['unrewarded']
+                                    phase = 'outcome'
+                            else:
+                                reward = self.no_lick
+                                phase = 'reward_window'
+                        else:
+                            phase = 'reward_window'
+                    elif self.current_timestep in trial_info.get('iti_window', []):
+                        phase = 'iti'
+                else:
+                    terminated = True
+
+            elif self.current_timestep in trial_info['reward_window']:
+                phase = 'reward_window'
+                reward_available = self.reward_sequence[self.current_timestep] > 0
+                current_state_idx = int(np.argmax(self.current_state))
+
+                if current_state_idx == self._IDX_REWARD_UNKNOWN:
+                    if action == 0:
+                        if reward_available:
+                            reward = self.reward_lick
+                            self.current_state = self.state_encodings['rewarded']
+                            phase = 'outcome'
+                        else:
+                            reward = self.lick_no_reward
+                            self.current_state = self.state_encodings['unrewarded']
+                            phase = 'outcome'
+                    else:
+                        reward = self.no_lick
+                        self.current_state = self.state_encodings['reward_unknown']
+
+                elif current_state_idx == self._IDX_REWARDED:
+                    phase = 'outcome'
+                    if action == 0:
+                        if reward_available:
+                            reward = self.reward_lick
+                        else:
+                            reward = self.lick_no_reward
+                            self.current_state = self.state_encodings['unrewarded']
+                    else:
+                        reward = self.no_lick
+
+                elif current_state_idx == self._IDX_UNREWARDED:
+                    phase = 'outcome'
+                    if action == 0:
+                        reward = self.lick_no_reward
+                    else:
+                        reward = self.no_lick
+
+                self.current_timestep += 1
+                if self.current_timestep not in trial_info['reward_window']:
+                    self.reward_window_action = None
+                    if self.current_timestep >= len(self.state_sequence):
+                        terminated = True
+                    elif self.current_timestep in trial_info.get('iti_window', []):
+                        pass
+                    else:
+                        terminated = True
+                elif self.current_timestep >= len(self.state_sequence):
+                    terminated = True
+
+            elif self.current_timestep in trial_info.get('iti_window', []):
+                phase = 'iti'
+                reward = 0.0
+                reward_available = False
+                self.current_timestep += 1
+                if self.current_timestep < len(self.state_sequence):
+                    self.current_state = self.state_sequence[self.current_timestep]
+                else:
+                    terminated = True
+            else:
+                phase = 'unknown'
+                reward = 0.0
+                reward_available = False
+                self.current_timestep += 1
+                if self.current_timestep < len(self.state_sequence):
+                    self.current_state = self.state_sequence[self.current_timestep]
+                else:
+                    terminated = True
+        else:
+            phase = 'iti' if self._is_iti_state(self.current_state) else 'unknown'
+            reward = 0.0
+            reward_available = False
+            self.current_timestep += 1
+            if self.current_timestep < len(self.state_sequence):
+                self.current_state = self.state_sequence[self.current_timestep]
+            else:
+                terminated = True
+
+        if self.current_timestep >= self.max_timesteps:
+            terminated = True
+
+        state_idx = int(np.argmax(self.current_state))
+        reversal_phase = trial_info.get('reversal_phase') if trial_info else None
+
+        info = {
+            'timestep': self.current_timestep,
+            'action': 'lick' if action == 0 else 'no_lick',
+            'reward': reward,
+            'reward_available': reward_available if 'reward_available' in dir() else False,
+            'state_idx': state_idx,
+            'state_name': (self._STATE_NAMES[state_idx]
+                           if state_idx < len(self._STATE_NAMES) else 'unknown'),
+            'trial_idx': trial_info['trial_idx'] if trial_info else None,
+            'trial_phase': phase,
+            'reversal_phase': reversal_phase,
+        }
+        return self.current_state.copy(), reward, terminated, truncated, info
+
+    def render(self):
+        if self.render_mode == "human":
+            state_idx = int(np.argmax(self.current_state))
+            state_name = (self._STATE_NAMES[state_idx]
+                          if state_idx < len(self._STATE_NAMES) else 'unknown')
+            print(f"Timestep: {self.current_timestep}, State: {state_name}")
+
+
+def load_reversal_abcdef_multitimestep_data(data_path):
+    """
+    Load reversal ABCDEF multi-timestep task data from pickle file.
+
+    Args:
+        data_path: Path to pickle file containing task data
+
+    Returns:
+        state_sequence: Array of states (N x 10)
+        reward_sequence: Array of reward availability (N,)
+        reversal_mask: Array indicating reversal phase (0=pre, 1=post)
+        phase_boundaries: Dict with phase boundaries
+        trial_structure: List of dicts with trial structure information
+        state_map: Dict mapping state names to indices
+    """
+    with open(data_path, "rb") as fid:
+        data = pickle.load(fid)
+
+    state_sequence_ohe = data["state_sequence_ohe"]
+    reward_sequence = data["reward_sequence"]
+    reversal_mask = data["sequence"]["masks"]["reversal"]
+    phase_boundaries = data.get("phase_boundaries", None)
+    trial_structure = data.get("trial_structure", [])
+    state_map = data.get("state_map", None)
+
+    return state_sequence_ohe, reward_sequence, reversal_mask, phase_boundaries, trial_structure, state_map
+
+
+def load_reversal_abcdef_multitimestep_multirev_data(data_path):
+    """
+    Load multi-reversal ABCDEF multi-timestep task data from pickle file.
+
+    Works for any number of reversal phases (generated by
+    generate_reversal_abcdef_multitimestep_multirev.ipynb).
+
+    Returns the same 6-tuple as load_reversal_abcdef_multitimestep_data so
+    existing code is compatible.  The phase_boundaries dict additionally
+    contains a 'phases' list with per-phase metadata and a full
+    'reversal_points' list.  trial_structure entries carry both
+    'reversal_phase' (0/1 binary contingency) and 'phase_idx' (0..N-1).
+
+    Returns
+    -------
+    state_sequence_ohe : (T, 10) float32
+    reward_sequence    : (T,) float32
+    reversal_mask      : (n_trials,) int  -- phase_idx per trial
+    phase_boundaries   : dict
+    trial_structure    : list of dicts
+    state_map          : dict
+    """
+    with open(data_path, "rb") as fid:
+        data = pickle.load(fid)
+
+    state_sequence_ohe = data["state_sequence_ohe"]
+    reward_sequence    = data["reward_sequence"]
+    reversal_mask      = data["sequence"]["masks"]["reversal"]
+    phase_boundaries   = data.get("phase_boundaries", None)
+    trial_structure    = data.get("trial_structure", [])
+    state_map          = data.get("state_map", None)
+
     return state_sequence_ohe, reward_sequence, reversal_mask, phase_boundaries, trial_structure, state_map
 
 
