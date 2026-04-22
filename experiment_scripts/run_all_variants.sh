@@ -15,7 +15,7 @@ RUNNER="$SCRIPT_DIR/run_meta_ac_abcdef_partial_multirun.py"
 DATE_TAG="${DATE_TAG:-$(date +%d_%m_%y)}"
 RESULTS_SUBDIR_DEFAULT="${DATE_TAG}_multirev_value_subspace_experiments"
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/../results/$RESULTS_SUBDIR_DEFAULT}"
-N_RUNS=${N_RUNS:-10}
+N_RUNS=${N_RUNS:-5}
 OVERWRITE=${OVERWRITE:-1}
 TASK=${TASK:-reversal_abcdef_multitimestep_partial_multirev}
 

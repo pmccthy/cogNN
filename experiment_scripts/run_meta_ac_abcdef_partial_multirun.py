@@ -69,7 +69,10 @@ PHASE_COLOR_MAP   = {0: STIM_COLORS_DARK, 1: STIM_COLORS_DARK}
 PHASE_LS_MAP      = {0: '--', 1: '-'}
 STIM_NAMES_MAP    = {0:'A (H→L)',1:'B (H→H)',2:'C (mid)',3:'D (mid)',4:'E (L→H)',5:'F (L→L)'}
 POP_COLORS        = {'Full':'#444444','Projecting':'#1f77b4',
-                     'Non-proj':'#d62728','Readout act':'#2ca02c'}
+                     'Non-proj':'#d62728',
+                     'Readout':'#2ca02c',
+                     'Actor logits':'#ff7f00',
+                     'Critic value':'#9467bd'}
 
 # ── Build model ────────────────────────────────────────────────────────────────
 
@@ -311,7 +314,7 @@ def analyse(metrics_numpy, model, cfg, trial_structure):
 
     # ── Stim-window averaged activations ──────────────────────────────────────
     _log("  Analysis: extracting stim-window activations...", indent=1)
-    all_activations, all_stim_labels, all_phase_labels = [], [], []
+    all_activations, all_stim_labels, all_phase_labels, all_phase_idx = [], [], [], []
     for tb in metrics_numpy['trial_boundaries']:
         ti = tb['trial_idx']
         if ti not in metrics_numpy['hidden_states']:
@@ -332,25 +335,30 @@ def analyse(metrics_numpy, model, cfg, trial_structure):
         all_activations.append(np.mean(activs, axis=0).squeeze())
         all_stim_labels.append(t_info['stimulus'])
         all_phase_labels.append(t_info['reversal_phase'])
+        all_phase_idx.append(t_info.get('phase_idx', t_info.get('reversal_phase', 0)))
 
     all_activations  = np.array(all_activations)
     all_stim_labels  = np.array(all_stim_labels)
     all_phase_labels = np.array(all_phase_labels)
+    all_phase_idx    = np.array(all_phase_idx)
     _log(f"  Analysis: {len(all_activations)} trials extracted  "
          f"(pre={int((all_phase_labels==0).sum())}, post={int((all_phase_labels==1).sum())})",
          indent=1)
 
     act_proj    = all_activations[:, readout_indices]
     act_nonproj = all_activations[:, non_readout_indices] if non_readout_indices else None
-    readout_all = np.hstack([act_proj @ W_actor.T  + b_actor,
-                             act_proj @ W_critic.T + b_critic])
+    actor_logits = act_proj @ W_actor.T + b_actor
+    critic_value = act_proj @ W_critic.T + b_critic
+    readout_all = np.hstack([actor_logits, critic_value])
 
     populations = OrderedDict()
     populations['Full']        = all_activations
     populations['Projecting']  = act_proj
     if non_readout_indices:
         populations['Non-proj'] = act_nonproj
-    populations['Readout act'] = readout_all
+    populations['Readout'] = readout_all
+    populations['Actor logits'] = actor_logits
+    populations['Critic value'] = critic_value
 
     # ── Regression ────────────────────────────────────────────────────────────
     _log("  Analysis: regression...", indent=1)
@@ -390,19 +398,32 @@ def analyse(metrics_numpy, model, cfg, trial_structure):
     PRE_HIGH  = [0, 1]; PRE_LOW  = [4, 5]
     POST_HIGH = [1, 4]; POST_LOW = [0, 5]
 
-    def _convergence_mask(stim_labels, phase_labels, phase, block):
+    def _block_mask_phase_idx(stim_labels, phase_idx_labels, phase_idx, block, use_second_half=False):
         start, end = block
         mask = np.zeros(len(stim_labels), dtype=bool)
         for s in range(6):
-            idx = np.where((stim_labels == s) & (phase_labels == phase))[0]
+            idx = np.where((stim_labels == s) & (phase_idx_labels == phase_idx))[0]
+            if idx.size == 0:
+                continue
+            if use_second_half:
+                idx = idx[idx.size // 2 :]
             mask[idx[start:end]] = True
         return mask
 
-    pre_conv_mask  = _convergence_mask(all_stim_labels, all_phase_labels, 0, tdr_pre_blk)
-    post_conv_mask = _convergence_mask(all_stim_labels, all_phase_labels, 1, tdr_post_blk)
-    _log(f"  Analysis: converged trials — pre={pre_conv_mask.sum()}, post={post_conv_mask.sum()}", indent=1)
+    # For multireversal tasks we explicitly restrict to:
+    #   pre  = phase_idx==0 only
+    #   post = phase_idx==1 only, second half of that phase (per stimulus)
+    pre_conv_mask = _block_mask_phase_idx(all_stim_labels, all_phase_idx, 0, tdr_pre_blk, use_second_half=False)
+    post_conv_mask = _block_mask_phase_idx(all_stim_labels, all_phase_idx, 1, tdr_post_blk, use_second_half=True)
+    _log(
+        "  Analysis: trial selection — pre=phase_idx 0; post=phase_idx 1 (second half)",
+        indent=1,
+    )
+    _log(f"  Analysis: selected trials — pre={pre_conv_mask.sum()}, post={post_conv_mask.sum()}", indent=1)
 
     def compute_value_axis(acts, phase, high, low, conv_mask):
+        # 'phase' here is the contingency parity (0=pre mapping, 1=post mapping)
+        # conv_mask already encodes which phase_idx trials we want to include.
         sel = (all_phase_labels == phase) & conv_mask
         h_m = sel & np.isin(all_stim_labels, high)
         l_m = sel & np.isin(all_stim_labels, low)
@@ -433,10 +454,14 @@ def analyse(metrics_numpy, model, cfg, trial_structure):
             return h[readout_indices]
         elif name == 'Non-proj':
             return h[non_readout_indices]
-        elif name == 'Readout act':
+        elif name == 'Readout':
             al = h[readout_indices] @ W_actor.T + b_actor
             cv = h[readout_indices] @ W_critic.T + b_critic
             return np.concatenate([al, cv])
+        elif name == 'Actor logits':
+            return h[readout_indices] @ W_actor.T + b_actor
+        elif name == 'Critic value':
+            return h[readout_indices] @ W_critic.T + b_critic
         return h
 
     _log("  Analysis: TDR value PSTH (time-resolved projections)...", indent=1)
@@ -473,26 +498,50 @@ def analyse(metrics_numpy, model, cfg, trial_structure):
         y = np.isin(all_stim_labels[mask], high).astype(int)
         return X, y
 
+    def _decoder_safe_cv(X, y):
+        """5-fold CV when possible; otherwise return NaN placeholders."""
+        if X.shape[0] == 0 or len(np.unique(y)) < 2:
+            return np.array([np.nan])
+        clf = Pipeline(
+            [
+                ("sc", StandardScaler()),
+                ("lr", LogisticRegression(max_iter=2000, C=1.0, random_state=42)),
+            ]
+        )
+        try:
+            return cross_val_score(clf, X, y, cv=cv5, scoring="accuracy")
+        except ValueError:
+            return np.array([np.nan])
+
     decoder_results = {}
     for name, acts in populations.items():
         X_pre,  y_pre  = _value_dataset(acts, 0, PRE_HIGH,  PRE_LOW,  pre_conv_mask)
         X_post, y_post = _value_dataset(acts, 1, POST_HIGH, POST_LOW, post_conv_mask)
         clf = Pipeline([('sc', StandardScaler()),
                         ('lr', LogisticRegression(max_iter=2000, C=1.0, random_state=42))])
-        cv_pre  = cross_val_score(clf, X_pre,  y_pre,  cv=cv5, scoring='accuracy')
-        cv_post = cross_val_score(clf, X_post, y_post, cv=cv5, scoring='accuracy')
-        sc1 = StandardScaler(); lr1 = LogisticRegression(max_iter=2000, C=1.0, random_state=42)
-        lr1.fit(sc1.fit_transform(X_pre), y_pre)
-        p2p = lr1.score(sc1.transform(X_post), y_post)
-        sc2 = StandardScaler(); lr2 = LogisticRegression(max_iter=2000, C=1.0, random_state=42)
-        lr2.fit(sc2.fit_transform(X_post), y_post)
-        p2pr = lr2.score(sc2.transform(X_pre), y_pre)
+        cv_pre  = _decoder_safe_cv(X_pre, y_pre)
+        cv_post = _decoder_safe_cv(X_post, y_post)
+        if (
+            X_pre.shape[0] > 0
+            and X_post.shape[0] > 0
+            and len(np.unique(y_pre)) >= 2
+            and len(np.unique(y_post)) >= 2
+        ):
+            sc1 = StandardScaler(); lr1 = LogisticRegression(max_iter=2000, C=1.0, random_state=42)
+            lr1.fit(sc1.fit_transform(X_pre), y_pre)
+            p2p = lr1.score(sc1.transform(X_post), y_post)
+            sc2 = StandardScaler(); lr2 = LogisticRegression(max_iter=2000, C=1.0, random_state=42)
+            lr2.fit(sc2.fit_transform(X_post), y_post)
+            p2pr = lr2.score(sc2.transform(X_pre), y_pre)
+        else:
+            p2p = float("nan")
+            p2pr = float("nan")
         decoder_results[name] = {
             'pre_cv': cv_pre, 'post_cv': cv_post,
             'pre_to_post': p2p, 'post_to_pre': p2pr,
         }
-        _log(f"  [{name:15s}] pre={cv_pre.mean():.3f}±{cv_pre.std():.3f}  "
-             f"post={cv_post.mean():.3f}±{cv_post.std():.3f}  "
+        _log(f"  [{name:15s}] pre={np.nanmean(cv_pre):.3f}±{np.nanstd(cv_pre):.3f}  "
+             f"post={np.nanmean(cv_post):.3f}±{np.nanstd(cv_post):.3f}  "
              f"pre→post={p2p:.3f}  post→pre={p2pr:.3f}", indent=1)
 
     _log(f"  Analysis complete  ({time.time()-_t0:.1f}s)", indent=1)
@@ -500,6 +549,7 @@ def analyse(metrics_numpy, model, cfg, trial_structure):
         'populations':       populations,
         'all_stim_labels':   all_stim_labels,
         'all_phase_labels':  all_phase_labels,
+        'all_phase_idx':     all_phase_idx,
         'pre_conv_mask':     pre_conv_mask,
         'post_conv_mask':    post_conv_mask,
         'tdr_projs':         tdr_projs,
@@ -535,6 +585,32 @@ def _compute_reversal_trial_indices(trial_boundaries):
     return rev_indices
 
 
+def _compute_reversal_global_indices(trial_boundaries):
+    """Return global trial indices where phase changes occur."""
+    if not trial_boundaries:
+        return []
+    rev = []
+    prev = trial_boundaries[0].get("phase_idx", trial_boundaries[0].get("reversal_phase", 0))
+    for i, tb in enumerate(trial_boundaries):
+        curr = tb.get("phase_idx", tb.get("reversal_phase", 0))
+        if curr != prev:
+            rev.append(i)
+            prev = curr
+    return rev
+
+
+def _global_trial_indices_per_stim(trial_boundaries):
+    """Map each stimulus key ('A'..'F') to the list of global trial indices where it occurred."""
+    out = {k: [] for k in "ABCDEF"}
+    for i, tb in enumerate(trial_boundaries):
+        s = tb.get("stimulus")
+        if s is None:
+            continue
+        if 0 <= int(s) < 6:
+            out["ABCDEF"[int(s)]].append(i)
+    return out
+
+
 def plot_lick_value(metrics_numpy, run_dir, cfg, plot_stims, run_idx, seed, freeze_label):
     """Lick probability and value estimate over trials, per stimulus."""
     import pandas as pd
@@ -543,7 +619,8 @@ def plot_lick_value(metrics_numpy, run_dir, cfg, plot_stims, run_idx, seed, free
     plot_keys  = [k for i, k in enumerate(['A','B','C','D','E','F']) if i in plot_stims]
     stim_idx   = {k: i for i, k in enumerate('ABCDEF')}
 
-    rev_indices = _compute_reversal_trial_indices(metrics_numpy['trial_boundaries'])
+    rev_indices = _compute_reversal_global_indices(metrics_numpy["trial_boundaries"])
+    x_by_stim = _global_trial_indices_per_stim(metrics_numpy["trial_boundaries"])
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     for ax, metric in zip(axes, ['trial_lick_probs', 'trial_values']):
@@ -555,17 +632,30 @@ def plot_lick_value(metrics_numpy, run_dir, cfg, plot_stims, run_idx, seed, free
             sm  = pd.Series(y).rolling(smooth, min_periods=1).mean().values
             col = STIM_COLORS_DARK[si]
             ls  = '-' if si in (0, 4) else '--'
-            ax.plot(np.arange(len(sm)), sm, color=col, lw=1.5, ls=ls,
+            x = np.array(x_by_stim.get(k, list(range(len(sm)))))[: len(sm)]
+            # Guard against any bookkeeping mismatch between per-stim y-series and
+            # available x-indices (e.g. when plotting filtered train/test subsets).
+            n = min(len(x), len(sm))
+            if n == 0:
+                continue
+            ax.plot(x[:n], sm[:n], color=col, lw=1.5, ls=ls,
                     label=stim_names[si])
         for ri, rv in enumerate(rev_indices):
             ax.axvline(rv, color='k', ls=':', lw=1.0,
                        label='Reversal' if ri == 0 else None)
-            ax.text(rv, ax.get_ylim()[1] if ax.get_ylim()[1] != 1.0 else 1.0,
-                    f'R{ri+1}', fontsize=6, ha='center', va='bottom', color='k')
+            ax.text(rv, 1.01, f"R{ri+1}", fontsize=6, ha="center",
+                    transform=ax.get_xaxis_transform(), color="k")
         ax.set_xlim(left=0)
         ax.set_ylabel('Lick probability' if metric=='trial_lick_probs' else 'Value estimate')
-        ax.legend(fontsize=7, ncol=4)
-    axes[1].set_xlabel('Trial (per stimulus)')
+        ax.set_xlim(left=0)
+        # Right x-limit to max observed x (avoid autoscale weirdness with sparse stims).
+        _xs = []
+        for k in plot_keys:
+            _xs.extend(list(x_by_stim.get(k, [])))
+        if _xs:
+            ax.set_xlim(0, max(_xs))
+        # No per-axis legend; use a single shared legend outside the panels.
+    axes[1].set_xlabel("Global trial index")
     _ro_str = f"partialro{cfg['readout_size']}"
     _pra    = '' if cfg['use_prev_action_reward'] else ', no prev A/R'
     n_rev   = len(rev_indices)
@@ -575,9 +665,103 @@ def plot_lick_value(metrics_numpy, run_dir, cfg, plot_stims, run_idx, seed, free
         'Solid = reversed (A, E)  |  Dashed = unchanged (B, F)',
         fontsize=9
     )
+    # Shared legend (outside plot panels)
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = OrderedDict(zip(labels, handles))
+    fig.legend(
+        by_label.values(),
+        by_label.keys(),
+        fontsize=7,
+        ncol=1,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        borderaxespad=0.0,
+    )
     plt.tight_layout()
     fig.savefig(run_dir / "lick_value.png", dpi=200, bbox_inches='tight')
     plt.close(fig)
+
+
+def plot_reward_consumed(metrics_numpy, run_dir, cfg, run_idx, seed, freeze_label):
+    """Plot reward consumed per trial (sum over reward window timesteps)."""
+    import pandas as pd
+
+    tb = metrics_numpy.get("trial_boundaries") or []
+    if not tb:
+        return
+    trc = metrics_numpy.get("trial_reward_consumed") or {}
+    y = np.array([float(trc.get(int(x["trial_idx"]), 0.0)) for x in tb], dtype=float)
+    x = np.arange(len(y), dtype=float)
+
+    smooth = 50
+    ys = pd.Series(y).rolling(smooth, min_periods=1).mean().values
+
+    rev_indices = _compute_reversal_global_indices(tb)
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 3.6))
+    ax.plot(x, ys, color="#333333", lw=1.8)
+    ax.plot(x, y, color="#333333", lw=0.6, alpha=0.15)
+    for ri, rv in enumerate(rev_indices):
+        ax.axvline(rv, color="k", ls=":", lw=1.0, alpha=0.7)
+        ax.text(rv, 1.01, f"R{ri+1}", fontsize=6, ha="center", transform=ax.get_xaxis_transform(), color="k")
+    ax.set_xlim(0, max(1.0, float(x.max())))
+    ax.set_xlabel("Global trial index")
+    ax.set_ylabel("Reward consumed\n(sum over reward window)")
+    _ro_str = f"partialro{cfg.get('readout_size', '?')}"
+    _pra = "" if cfg.get("use_prev_action_reward", True) else ", no prev A/R"
+    ax.set_title(f"Reward consumed — Run {run_idx+1} seed={seed} | {freeze_label} | {_ro_str}{_pra}", fontsize=9)
+    plt.tight_layout()
+    fig.savefig(run_dir / "reward_consumed.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_aux_iti_accuracy(metrics_numpy, run_dir, cfg, run_idx, seed, freeze_label):
+    """Plot auxiliary ITI stimulus accuracy and reward MSE over trials."""
+    import pandas as pd
+
+    aux = metrics_numpy.get("aux_iti") or {}
+    xs = np.asarray(aux.get("trial_global_idx", []), dtype=float)
+    acc = np.asarray(aux.get("stim_acc", []), dtype=float)
+    mse = np.asarray(aux.get("reward_mse", []), dtype=float)
+    if xs.size == 0 or (acc.size == 0 and mse.size == 0):
+        return
+
+    smooth = 50
+    fig, axes = plt.subplots(2, 1, figsize=(12, 5.2), sharex=True)
+    if acc.size:
+        acc_s = pd.Series(acc).rolling(smooth, min_periods=1).mean().values
+        axes[0].plot(xs, acc_s, color="#1f77b4", lw=2.0)
+        axes[0].plot(xs, acc, color="#1f77b4", lw=0.7, alpha=0.15)
+        axes[0].set_ylabel("Aux stim acc")
+        axes[0].set_ylim(0.0, 1.05)
+    if mse.size:
+        mse_s = pd.Series(mse).rolling(smooth, min_periods=1).mean().values
+        axes[1].plot(xs, mse_s, color="#d62728", lw=2.0)
+        axes[1].plot(xs, mse, color="#d62728", lw=0.7, alpha=0.15)
+        axes[1].set_ylabel("Aux reward MSE")
+    axes[1].set_xlabel("Global trial index")
+    for ax in axes:
+        ax.set_xlim(left=0)
+    _ro_str = f"partialro{cfg.get('readout_size', '?')}"
+    _pra = "" if cfg.get("use_prev_action_reward", True) else ", no prev A/R"
+    plt.suptitle(
+        f"Aux ITI predictions — Run {run_idx+1} seed={seed} | {freeze_label} | {_ro_str}{_pra}",
+        fontsize=9,
+    )
+    plt.tight_layout()
+    fig.savefig(run_dir / "aux_iti_accuracy.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _subsample_for_plot(ts, ys, max_points=50_000):
+    """Downsample long series so Agg savefig does not overflow on huge paths."""
+    ts = np.asarray(ts, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    n = len(ts)
+    if n <= max_points:
+        return ts, ys
+    stride = int(np.ceil(n / max_points))
+    return ts[::stride], ys[::stride]
 
 
 def plot_grad_norms(metrics_numpy, run_dir, cfg, freeze_label, run_idx, seed, phase_boundaries):
@@ -588,23 +772,42 @@ def plot_grad_norms(metrics_numpy, run_dir, cfg, freeze_label, run_idx, seed, ph
         return
     ts   = np.array(gn['timestep'])
     smooth = 2000
+    max_plot_points = 50_000
 
     rev_ts = phase_boundaries.get('reversal_points', [])
 
-    keys   = ['total', 'rnn', 'actor_fc', 'critic_fc']
-    labels = ['Total', 'RNN', 'Actor FC', 'Critic FC']
-    colors_gn = ['#333333', '#1f77b4', '#ff7f00', '#2ca02c']
+    keys   = ['total', 'rnn', 'rnn_in', 'rnn_rec', 'actor_fc', 'critic_fc']
+    labels = ['Total', 'RNN', 'RNN input (W_ih)', 'RNN recurrent (W_hh)', 'Actor FC', 'Critic FC']
+    colors_gn = ['#333333', '#1f77b4', '#4c72b0', '#55a868', '#ff7f00', '#2ca02c']
 
     fig, axes = plt.subplots(len(keys), 1, figsize=(12, 2.5 * len(keys)), sharex=True)
     for ax, k, lbl, col in zip(axes, keys, labels, colors_gn):
-        vals = np.array(gn[k])
+        vals = np.array(gn.get(k, []), dtype=float)
         if len(vals) == 0:
             continue
         sm = pd.Series(vals).rolling(smooth, min_periods=1).mean().values
-        ax.semilogy(ts, vals, color=col, lw=0.4, alpha=0.2)
-        ax.semilogy(ts, sm,   color=col, lw=1.5, label=lbl)
+        # Clip for log scale; frozen / zero-grad runs can be all zeros.
+        pos_floor = 1e-12
+        vals_plot = np.maximum(vals, pos_floor)
+        sm_plot = np.maximum(sm, pos_floor)
+        ts_r, vals_r = _subsample_for_plot(ts, vals_plot, max_plot_points)
+        ts_s, sm_s = _subsample_for_plot(ts, sm_plot, max_plot_points)
+        ax.semilogy(ts_r, vals_r, color=col, lw=0.4, alpha=0.2)
+        ax.semilogy(ts_s, sm_s, color=col, lw=1.5, label=lbl)
         for rt in rev_ts:
             ax.axvline(rt, color='k', ls=':', lw=0.8, alpha=0.5)
+        # Special markers if provided (timestep space)
+        ro_freeze_ts = phase_boundaries.get("readout_freeze_ts", None)
+        plast_off_ts = phase_boundaries.get("plasticity_off_ts", None)
+        if ro_freeze_ts is not None:
+            ax.axvline(ro_freeze_ts, color="k", lw=2.0, ls="--", alpha=0.9)
+        if plast_off_ts is not None:
+            ax.axvline(plast_off_ts, color="k", lw=2.3, ls="-", alpha=0.9)
+        # Tighten y-lims around the mean to improve visibility (log-scale).
+        # Use smoothed mean as reference to avoid single spikes dominating.
+        ref = float(np.mean(sm_plot)) if np.all(np.isfinite(sm_plot)) else float(np.mean(vals_plot))
+        ref = max(ref, 1e-12)
+        ax.set_ylim(ref / 50.0, ref * 50.0)
         ax.set_ylabel(f'{lbl}\ngrad norm')
         ax.legend(fontsize=8, loc='upper right')
     axes[-1].set_xlabel('Timestep')
@@ -616,6 +819,127 @@ def plot_grad_norms(metrics_numpy, run_dir, cfg, freeze_label, run_idx, seed, ph
     plt.tight_layout()
     fig.savefig(run_dir / 'grad_norms.png', dpi=200, bbox_inches='tight')
     plt.close(fig)
+
+
+def plot_phase_generalisation_matrices(
+    results,
+    run_dir,
+    freeze_label,
+    max_phases=10,
+    min_trials_per_split=10,
+):
+    """Plot phase generalisation matrices for value decoding.
+
+    Saves one heatmap for each population:
+    - Off-diagonal: train on all trials in phase i, test on all in phase j.
+    - Diagonal: within-phase decoding (5-fold CV) using all trials from that phase.
+
+    Labels respect each phase's contingency parity (even=pre, odd=post).
+    """
+    stim_labels = results["all_stim_labels"]
+    phase_idx = results.get("all_phase_idx")
+    if phase_idx is None:
+        return
+
+    populations = results.get("populations", {})
+    if not populations:
+        return
+
+    PRE_HIGH, PRE_LOW = results["PRE_HIGH"], results["PRE_LOW"]
+    POST_HIGH, POST_LOW = results["POST_HIGH"], results["POST_LOW"]
+
+    phases = np.unique(phase_idx)
+    phases = phases[phases < max_phases]
+    n = len(phases)
+    if n < 2:
+        return
+
+    def _high_low_for_phase(ph):
+        parity = int(ph % 2)
+        return (PRE_HIGH, PRE_LOW) if parity == 0 else (POST_HIGH, POST_LOW)
+
+    def _mask_for_phase(ph):
+        """Return boolean mask for selecting labelled trials in phase ph."""
+        high, low = _high_low_for_phase(ph)
+        base = (phase_idx == ph) & np.isin(stim_labels, high + low)
+        return base
+
+    def _dataset_for_phase(ph, acts):
+        mask = _mask_for_phase(ph)
+        high, low = _high_low_for_phase(ph)
+        X = acts[mask]
+        y = np.isin(stim_labels[mask], high).astype(int)
+        return X, y
+
+    out = {"phases": phases, "by_population": {}}
+
+    for pop_name, acts in populations.items():
+        if acts is None:
+            continue
+
+        # 1) Train all -> test all (phase×phase), off-diagonal
+        acc = np.full((n, n), np.nan, dtype=float)
+        for i, phi in enumerate(phases):
+            X_tr, y_tr = _dataset_for_phase(phi, acts)
+            if X_tr.shape[0] < min_trials_per_split or len(np.unique(y_tr)) < 2:
+                continue
+            sc = StandardScaler()
+            clf = LogisticRegression(max_iter=2000, C=1.0, random_state=42)
+            clf.fit(sc.fit_transform(X_tr), y_tr)
+            for j, phj in enumerate(phases):
+                if i == j:
+                    continue
+                X_te, y_te = _dataset_for_phase(phj, acts)
+                if X_te.shape[0] < min_trials_per_split or len(np.unique(y_te)) < 2:
+                    continue
+                acc[i, j] = clf.score(sc.transform(X_te), y_te)
+
+        # 2) Within-phase decoding (5-fold CV), on the diagonal
+        cv5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        for i, phi in enumerate(phases):
+            X, y = _dataset_for_phase(phi, acts)
+            if X.shape[0] < min_trials_per_split or len(np.unique(y)) < 2:
+                continue
+            clf = Pipeline(
+                [
+                    ("sc", StandardScaler()),
+                    ("lr", LogisticRegression(max_iter=2000, C=1.0, random_state=42)),
+                ]
+            )
+            scores = cross_val_score(clf, X, y, cv=cv5, scoring="accuracy")
+            acc[i, i] = float(np.mean(scores))
+
+        out["by_population"][pop_name] = {
+            "phase_matrix": acc,
+        }
+
+        # Plot a single heatmap for this population
+        fig, ax = plt.subplots(1, 1, figsize=(6.8, 5.6))
+        vmin, vmax = 0.4, 1.0
+        im = ax.imshow(acc, vmin=vmin, vmax=vmax, cmap="jet", interpolation="nearest")
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels([str(int(p)) for p in phases])
+        ax.set_yticklabels([str(int(p)) for p in phases])
+        ax.set_xlabel("Test phase_idx")
+        ax.set_ylabel("Train phase_idx")
+        ax.set_title(
+            "Value decoder phase generalisation\n"
+            f"Population={pop_name}  |  diagonal = 5-fold CV  |  [{freeze_label}]",
+            fontsize=9,
+        )
+        fig.subplots_adjust(right=0.86)
+        cax = fig.add_axes([0.89, 0.15, 0.03, 0.70])
+        cbar = fig.colorbar(im, cax=cax)
+        cbar.set_label("Accuracy")
+        fig.savefig(
+            run_dir / f"decoder_phase_generalisation_matrix_{pop_name.replace(' ', '_')}.png",
+            dpi=200,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+    return out
 
 
 def plot_tdr_value_psth(results, run_dir, cfg, trial_structure, plot_stims, freeze_label):
@@ -700,7 +1024,13 @@ def plot_decoder(decoder_results, run_dir, freeze_label):
         ax.set_title(name, fontsize=9)
         if ax is axes[0]:
             ax.set_ylabel('Accuracy')
-    plt.suptitle(f'Value decoder  [{freeze_label}]', fontsize=9)
+    plt.suptitle(
+        "Value decoder (restricted trial selection)\n"
+        "pre = phase_idx 0 (per-stimulus block); post = phase_idx 1 (second half; per-stimulus block)\n"
+        "Note: phase heatmaps use all labelled trials per phase (diagonal uses 5-fold CV).\n"
+        f"[{freeze_label}]",
+        fontsize=8.5,
+    )
     plt.tight_layout()
     fig.savefig(run_dir / "value_decoder.png", dpi=200, bbox_inches='tight')
     plt.close(fig)
@@ -734,7 +1064,6 @@ def plot_agg_lick_value(run_dirs, agg_dir, freeze_label, plot_stims):
     fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=False)
 
     for run_i, lv in enumerate(all_metrics):
-        rev_idx   = lv['rev_idx']
         for k in stim_keys:
             si  = stim_idx[k]
             col = STIM_COLORS_DARK[si]
@@ -743,7 +1072,14 @@ def plot_agg_lick_value(run_dirs, agg_dir, freeze_label, plot_stims):
                 if len(y) == 0:
                     continue
                 sm = pd.Series(y).rolling(smooth, min_periods=1).mean().values
-                axes[ax_i].plot(np.arange(len(sm)), sm, color=col, lw=0.7,
+                # Prefer global trial indices for correct alignment
+                x = None
+                x_map = lv.get("global_trial_indices_by_stim")
+                if x_map is not None and k in x_map:
+                    x = np.asarray(x_map[k])[: len(sm)]
+                if x is None or len(x) == 0:
+                    x = np.arange(len(sm))
+                axes[ax_i].plot(x, sm, color=col, lw=0.7,
                                 alpha=0.25, zorder=2)
 
     # Mean across runs per stimulus
@@ -756,27 +1092,93 @@ def plot_agg_lick_value(run_dirs, agg_dir, freeze_label, plot_stims):
             for lv in all_metrics:
                 y = lv[metric][k]
                 if len(y) > 0:
-                    series_list.append(pd.Series(y).rolling(smooth, min_periods=1).mean().values)
+                    sm = pd.Series(y).rolling(smooth, min_periods=1).mean().values
+                    x = None
+                    x_map = lv.get("global_trial_indices_by_stim")
+                    if x_map is not None and k in x_map:
+                        x = np.asarray(x_map[k])[: len(sm)]
+                    if x is None or len(x) == 0:
+                        x = np.arange(len(sm))
+                    series_list.append(pd.Series(sm, index=x))
             if not series_list:
                 continue
-            min_len = min(len(s) for s in series_list)
-            mat = np.stack([s[:min_len] for s in series_list])
-            axes[ax_i].plot(np.arange(min_len), mat.mean(0), color=col, lw=2.0,
-                            ls=ls, label=stim_names[si], zorder=4)
+            # Align on global index and average across runs
+            all_x = np.unique(np.concatenate([s.index.values for s in series_list]))
+            all_x.sort()
+            mat = np.stack([s.reindex(all_x).to_numpy() for s in series_list])
+            mean = np.nanmean(mat, axis=0)
+            axes[ax_i].plot(all_x, mean, color=col, lw=2.0, ls=ls,
+                            label=stim_names[si], zorder=4)
 
-    # Reversal line (use median reversal index across runs)
-    rev_indices = [lv['rev_idx'] for lv in all_metrics if lv['rev_idx'] is not None]
-    if rev_indices:
-        med_rev = int(np.median(rev_indices))
-        for ax in axes:
-            ax.axvline(med_rev, color='k', ls=':', lw=1.5, label='Reversal', zorder=5)
+    # Reversal lines (global-trial indexing if available)
+    rev_lists = [lv.get("rev_indices_global") for lv in all_metrics if lv.get("rev_indices_global") is not None]
+    if rev_lists:
+        n_rev = min(len(r) for r in rev_lists)
+        for ri in range(n_rev):
+            xs = [r[ri] for r in rev_lists if len(r) > ri]
+            if not xs:
+                continue
+            med = int(np.median(xs))
+            for ax in axes:
+                ax.axvline(
+                    med,
+                    color="k",
+                    ls=":",
+                    lw=1.2,
+                    label="Reversal" if ri == 0 else None,
+                    zorder=5,
+                    alpha=0.8,
+                )
+                ax.text(
+                    med,
+                    1.01,
+                    f"R{ri+1}",
+                    fontsize=6,
+                    ha="center",
+                    transform=ax.get_xaxis_transform(),
+                    color="k",
+                )
+    else:
+        # Fallback to old A-stream indices
+        rev_lists = [lv.get("rev_indices") for lv in all_metrics if lv.get("rev_indices") is not None]
+        if rev_lists:
+            n_rev = min(len(r) for r in rev_lists)
+            for ri in range(n_rev):
+                xs = [r[ri] for r in rev_lists if len(r) > ri]
+                if not xs:
+                    continue
+                med = int(np.median(xs))
+                for ax in axes:
+                    ax.axvline(med, color="k", ls=":", lw=1.2, label="Reversal" if ri == 0 else None, zorder=5)
+        else:
+            rev_indices = [lv.get("rev_idx") for lv in all_metrics if lv.get("rev_idx") is not None]
+            if rev_indices:
+                med_rev = int(np.median(rev_indices))
+                for ax in axes:
+                    ax.axvline(med_rev, color="k", ls=":", lw=1.5, label="Reversal", zorder=5)
 
     axes[0].set_ylabel('Lick probability')
     axes[1].set_ylabel('Value estimate')
-    axes[1].set_xlabel('Trial (per stimulus)')
+    axes[1].set_xlabel("Global trial index")
     for ax in axes:
         ax.set_xlim(left=0)
-        ax.legend(fontsize=7, ncol=4)
+        # Right x-limit to max observed x across mean traces
+        if ax.lines:
+            xmax = max((np.max(ln.get_xdata()) for ln in ax.lines if len(ln.get_xdata()) > 0), default=None)
+            if xmax is not None and np.isfinite(xmax):
+                ax.set_xlim(0, float(xmax))
+        # No per-axis legend; use shared legend outside.
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = OrderedDict(zip(labels, handles))
+    fig.legend(
+        by_label.values(),
+        by_label.keys(),
+        fontsize=7,
+        ncol=1,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        borderaxespad=0.0,
+    )
     plt.suptitle(
         f'Lick probability and value — {len(all_metrics)} runs  [{freeze_label}]\n'
         'Solid = reversed (A, E)  |  Dashed = unchanged (B, F)  |  '
@@ -789,7 +1191,7 @@ def plot_agg_lick_value(run_dirs, agg_dir, freeze_label, plot_stims):
     _log(f"  Saved agg_lick_value.png", indent=1)
 
 
-def plot_agg_grad_norms(run_dirs, agg_dir, freeze_label):
+def plot_agg_grad_norms(run_dirs, agg_dir, freeze_label, phase_boundaries=None):
     """Aggregate gradient norms across runs: mean ± SEM per component."""
     import pandas as pd
     all_gn = []
@@ -804,7 +1206,11 @@ def plot_agg_grad_norms(run_dirs, agg_dir, freeze_label):
         _log("  WARNING: no grad_norms data found — skipping agg grad norm plot")
         return
 
+    phase_boundaries = phase_boundaries or {}
+    rev_ts = phase_boundaries.get("reversal_points", [])
+
     smooth = 5000
+    max_plot_points = 50_000
     keys   = ['total', 'rnn', 'actor_fc', 'critic_fc']
     labels = ['Total', 'RNN', 'Actor FC', 'Critic FC']
     colors_gn = ['#333333', '#1f77b4', '#ff7f00', '#2ca02c']
@@ -823,13 +1229,36 @@ def plot_agg_grad_norms(run_dirs, agg_dir, freeze_label):
         mat = np.stack(mats)
         mn  = mat.mean(0)
         se  = mat.std(0) / np.sqrt(len(mats))
-        ax.semilogy(ts_ref, mn,          color=col, lw=1.5, label=lbl)
-        ax.fill_between(ts_ref, np.maximum(mn - se, 1e-12), mn + se,
-                        color=col, alpha=0.2)
-        # Individual runs
+        mn_plot = np.maximum(mn, 1e-12)
+        lo = np.maximum(mn - se, 1e-12)
+        hi = np.maximum(mn + se, 1e-12)
+        ts_m, mn_s = _subsample_for_plot(ts_ref, mn_plot, max_plot_points)
+        _, lo_s = _subsample_for_plot(ts_ref, lo, max_plot_points)
+        _, hi_s = _subsample_for_plot(ts_ref, hi, max_plot_points)
+        ax.semilogy(ts_m, mn_s, color=col, lw=1.5, label=lbl)
+        ax.fill_between(ts_m, lo_s, hi_s, color=col, alpha=0.2)
+        # Individual runs (subsample each)
         for row in mats:
-            ax.semilogy(ts_ref, row, color=col, lw=0.5, alpha=0.15)
+            row_p = np.maximum(row, 1e-12)
+            ts_r, row_s = _subsample_for_plot(ts_ref, row_p, max_plot_points)
+            ax.semilogy(ts_r, row_s, color=col, lw=0.5, alpha=0.15)
+        for ri, rt in enumerate(rev_ts):
+            ax.axvline(rt, color="k", ls=":", lw=0.8, alpha=0.5)
+            if ri < 12:  # avoid clutter on many reversals
+                ax.text(
+                    rt,
+                    1.01,
+                    f"R{ri+1}",
+                    fontsize=6,
+                    ha="center",
+                    transform=ax.get_xaxis_transform(),
+                    color="k",
+                )
         ax.set_ylabel(f'{lbl}\ngrad norm')
+        # Tighten y-lims around the mean to improve visibility (log-scale).
+        ref = float(np.mean(mn_plot)) if np.all(np.isfinite(mn_plot)) else float(np.mean(mn))
+        ref = max(ref, 1e-12)
+        ax.set_ylim(ref / 50.0, ref * 50.0)
         ax.legend(fontsize=8, loc='upper right')
     axes[-1].set_xlabel('Timestep')
     plt.suptitle(
@@ -840,6 +1269,51 @@ def plot_agg_grad_norms(run_dirs, agg_dir, freeze_label):
     fig.savefig(agg_dir / 'agg_grad_norms.png', dpi=200, bbox_inches='tight')
     plt.close(fig)
     _log(f"  Saved agg_grad_norms.png", indent=1)
+
+
+def plot_agg_reward_consumed(run_dirs, agg_dir, freeze_label):
+    """Aggregate reward consumed across runs (mean ± SEM)."""
+    import pandas as pd
+
+    ys = []
+    for rd in run_dirs:
+        pkl = rd / "lick_value_data.pkl"
+        if not pkl.exists():
+            continue
+        with open(pkl, "rb") as f:
+            lv = pickle.load(f)
+        y = lv.get("trial_reward_consumed")
+        if y is None:
+            continue
+        y = np.asarray(y, dtype=float)
+        if y.size == 0:
+            continue
+        ys.append(y)
+    if not ys:
+        _log("  WARNING: no trial_reward_consumed found — skipping agg reward consumed plot")
+        return
+
+    min_len = min(len(y) for y in ys)
+    mat = np.stack([y[:min_len] for y in ys])
+    x = np.arange(min_len, dtype=float)
+    smooth = 50
+    mat_s = np.stack([pd.Series(row).rolling(smooth, min_periods=1).mean().values for row in mat])
+    mn = mat_s.mean(0)
+    se = mat_s.std(0) / np.sqrt(mat_s.shape[0])
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 3.6))
+    for row in mat_s:
+        ax.plot(x, row, color="#333333", lw=0.7, alpha=0.15)
+    ax.plot(x, mn, color="#111111", lw=2.2)
+    ax.fill_between(x, mn - se, mn + se, color="#111111", alpha=0.15)
+    ax.set_xlim(0, max(1.0, float(x.max())))
+    ax.set_xlabel("Global trial index")
+    ax.set_ylabel("Reward consumed\n(sum over reward window)")
+    ax.set_title(f"Reward consumed — {mat_s.shape[0]} runs [{freeze_label}]", fontsize=9)
+    plt.tight_layout()
+    fig.savefig(agg_dir / "agg_reward_consumed.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    _log("  Saved agg_reward_consumed.png", indent=1)
 
 
 # ── Aggregate plots ────────────────────────────────────────────────────────────
@@ -959,7 +1433,67 @@ def aggregate_plots(run_dirs, agg_dir, cfg, freeze_label, plot_stims):
 
     # ── Aggregate lick/value ───────────────────────────────────────────────────
     plot_agg_lick_value(run_dirs, agg_dir, freeze_label, plot_stims)
-    plot_agg_grad_norms(run_dirs, agg_dir, freeze_label)
+    plot_agg_grad_norms(run_dirs, agg_dir, freeze_label, phase_boundaries=cfg.get("phase_boundaries_for_plots"))
+    plot_agg_reward_consumed(run_dirs, agg_dir, freeze_label)
+
+    # ── Aggregate phase generalisation matrices (mean across runs) ─────────────
+    objs = []
+    for rd in run_dirs:
+        pkl = rd / "decoder_phase_generalisation_matrices.pkl"
+        if not pkl.exists():
+            continue
+        with open(pkl, "rb") as f:
+            obj = pickle.load(f)
+        if obj is not None:
+            objs.append(obj)
+
+    if objs:
+        phases_ref = objs[0].get("phases")
+        if phases_ref is not None and all(
+            o.get("phases") is not None
+            and o.get("phases").shape == phases_ref.shape
+            and np.all(o.get("phases") == phases_ref)
+            for o in objs
+        ):
+            pop_names = sorted(objs[0].get("by_population", {}).keys())
+            for pop in pop_names:
+                mats_all, mats_within = [], []
+                for o in objs:
+                    bp = o.get("by_population", {}).get(pop)
+                    if not bp:
+                        continue
+                    m = bp.get("phase_matrix")
+                    if m is not None:
+                        mats_all.append(m)
+                if not mats_all:
+                    continue
+                mean_mat = np.nanmean(np.stack(mats_all, axis=0), axis=0)
+                n = mean_mat.shape[0]
+
+                fig, ax = plt.subplots(1, 1, figsize=(6.8, 5.6))
+                im = ax.imshow(mean_mat, vmin=0.4, vmax=1.0, cmap="viridis", interpolation="nearest")
+                ax.set_xticks(range(n))
+                ax.set_yticks(range(n))
+                ax.set_xticklabels([str(int(p)) for p in phases_ref])
+                ax.set_yticklabels([str(int(p)) for p in phases_ref])
+                ax.set_xlabel("Test phase_idx")
+                ax.set_ylabel("Train phase_idx")
+                ax.set_title(
+                    "Value decoder phase generalisation (mean across runs)\n"
+                    f"Population={pop}  |  diagonal = 5-fold CV  |  [{freeze_label}]",
+                    fontsize=9,
+                )
+                fig.subplots_adjust(right=0.86)
+                cax = fig.add_axes([0.89, 0.15, 0.03, 0.70])
+                cbar = fig.colorbar(im, cax=cax)
+                cbar.set_label("Accuracy")
+                fig.savefig(
+                    agg_dir / f"agg_decoder_phase_generalisation_matrix_{pop.replace(' ', '_')}.png",
+                    dpi=200,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
+            _log("  Saved aggregate phase generalisation matrices", indent=1)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -986,6 +1520,13 @@ def main():
                         help='1=exclude C/D from plots')
     parser.add_argument('--overwrite', action='store_true',
                         help='Re-run seeds that already have run_results.pkl')
+    parser.add_argument(
+        "--run_indices",
+        type=str,
+        default="",
+        help="Optional comma-separated run indices to execute (e.g. '0,3,7'). "
+        "If set, only those indices are run (others are skipped).",
+    )
     parser.add_argument('--results_dir', type=str,
                         default='../results/20_03_26_value_subspace_experiments')
     parser.add_argument('--task_data_dir', type=str,
@@ -1066,7 +1607,12 @@ def main():
 
     run_dirs = []
     # ── Per-seed training & analysis ──────────────────────────────────────────
-    for run_idx in range(n_runs):
+    if args.run_indices.strip():
+        run_indices = sorted({int(x) for x in args.run_indices.split(",") if x.strip() != ""})
+    else:
+        run_indices = list(range(n_runs))
+
+    for run_idx in run_indices:
         seed = run_idx * 7 + 42
         run_dir = variant_dir / f'run_{run_idx:02d}_seed{seed}'
         run_dir.mkdir(exist_ok=True)
@@ -1123,6 +1669,11 @@ def main():
         _log(f"    tdr_value_psth_*.png", indent=2)
         plot_decoder(results['decoder_results'], run_dir, freeze_label)
         _log(f"    value_decoder.png", indent=2)
+        mat_obj = plot_phase_generalisation_matrices(results, run_dir, freeze_label)
+        if mat_obj is not None:
+            with open(run_dir / "decoder_phase_generalisation_matrices.pkl", "wb") as f:
+                pickle.dump(mat_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            _log(f"    decoder_phase_generalisation_matrix_*.png", indent=2)
 
         # Save lightweight lick/value data for aggregate plot
         rev_trial_idx = sum(1 for tb in metrics_numpy['trial_boundaries']
@@ -1131,6 +1682,9 @@ def main():
             'trial_lick_probs': {k: metrics_numpy['trial_lick_probs'][k] for k in 'ABCDEF'},
             'trial_values':     {k: metrics_numpy['trial_values'][k]     for k in 'ABCDEF'},
             'rev_idx': rev_trial_idx,
+            'rev_indices': _compute_reversal_trial_indices(metrics_numpy['trial_boundaries']),
+            'rev_indices_global': _compute_reversal_global_indices(metrics_numpy['trial_boundaries']),
+            'global_trial_indices_by_stim': _global_trial_indices_per_stim(metrics_numpy['trial_boundaries']),
             'grad_norms': metrics_numpy.get('grad_norms', {}),
         }
         with open(run_dir / 'lick_value_data.pkl', 'wb') as f:
@@ -1150,6 +1704,14 @@ def main():
             'all_phase_labels': results['all_phase_labels'],
             'pre_conv_mask':   results['pre_conv_mask'],
             'post_conv_mask':  results['post_conv_mask'],
+            # Save minimal weights so "Readout act" plots can be regenerated later.
+            'readout_weights': {
+                'actor_fc_weight': model.actor_fc.weight.detach().cpu().numpy(),
+                'actor_fc_bias': model.actor_fc.bias.detach().cpu().numpy(),
+                'critic_fc_weight': model.critic_fc.weight.detach().cpu().numpy(),
+                'critic_fc_bias': model.critic_fc.bias.detach().cpu().numpy(),
+                'readout_indices': list(range(cfg['readout_size'])),
+            },
             'params':          {**cfg, 'seed': seed},
         }
         with open(run_dir / 'run_results.pkl', 'wb') as f:
